@@ -49,6 +49,7 @@ func (m *mockConf) SetCalibrationDischargeThreshold(int)           {}
 func (m *mockConf) SetCalibrationHoldDurationMinutes(int)          {}
 func (m *mockConf) SetUpperLimit(i int)                            { m.upper = i }
 func (m *mockConf) SetLowerLimit(i int)                            { m.lower = i }
+func (m *mockConf) SetChargeRange(upper, lower int)                { m.upper, m.lower = upper, lower }
 func (m *mockConf) SetPreventIdleSleep(bool)                       {}
 func (m *mockConf) SetDisableChargingPreSleep(bool)                {}
 func (m *mockConf) SetPreventSleepOnAdapterDisable(b bool)         { m.preventSleepOnAdapterDisable = b }

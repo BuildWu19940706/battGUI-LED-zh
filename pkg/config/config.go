@@ -26,6 +26,7 @@ type Config interface {
 
 	SetUpperLimit(int)
 	SetLowerLimit(int)
+	SetChargeRange(upper, lower int)
 	SetPreventIdleSleep(bool)
 	SetDisableChargingPreSleep(bool)
 	SetPreventSystemSleep(bool)

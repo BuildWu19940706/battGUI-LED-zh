@@ -42,6 +42,7 @@ func setupRoutes() *gin.Engine {
 	router.GET("/config", getConfig)
 	router.GET("/limit", getLimit)
 	router.PUT("/limit", setLimit)
+	router.PUT("/charge-range", setChargeRange)
 	router.PUT("/disable", setDisableFor)
 	router.POST("/charge-once/limit", postChargeOnceToLimit)
 	router.POST("/charge-once/full", postChargeOnceToFull)

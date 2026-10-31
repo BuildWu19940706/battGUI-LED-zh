@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -386,6 +387,18 @@ func (f *File) SetLowerLimit(i int) {
 	f.c.LowerLimitDelta = &delta
 }
 
+// SetChargeRange changes both fields under one lock. Setting the upper limit
+// first with the previous delta could otherwise panic or expose a partial pair.
+func (f *File) SetChargeRange(upper, lower int) {
+	if lower < 0 || lower >= upper || upper > 100 {
+		panic("invalid charge range")
+	}
+	delta := upper - lower
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.c.Limit, f.c.LowerLimitDelta = &upper, &delta
+}
+
 func (f *File) SetPreventIdleSleep(b bool) {
 	if f.c == nil {
 		panic("config is nil")
@@ -733,16 +746,25 @@ func (f *File) Save() error {
 		return pkgerrors.New("config is nil")
 	}
 
-	fp, err := os.OpenFile(f.filepath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
+	// Write and sync a sibling, then rename: a failed write must not truncate
+	// the currently working configuration. Follow an existing config symlink.
+	target := f.filepath
+	if resolved, err := filepath.EvalSymlinks(target); err == nil {
+		target = resolved
+	}
+	fp, err := os.CreateTemp(filepath.Dir(target), ".batt-config-*")
 	if err != nil {
 		return pkgerrors.Wrapf(err, "failed to open file %s", f.filepath)
 	}
-	defer func(fp *os.File) {
-		err := fp.Close()
-		if err != nil {
-			logrus.Warnf("failed to close file %s", f.filepath)
-		}
-	}(fp)
+	defer os.Remove(fp.Name())
+	defer fp.Close()
+	mode := os.FileMode(0644)
+	if info, err := os.Stat(target); err == nil {
+		mode = info.Mode().Perm()
+	}
+	if err := fp.Chmod(mode); err != nil {
+		return err
+	}
 
 	enc := json.NewEncoder(fp)
 	enc.SetIndent("", "  ")
@@ -751,7 +773,13 @@ func (f *File) Save() error {
 		return pkgerrors.Wrapf(err, "failed to encode config to file %s", f.filepath)
 	}
 
-	return nil
+	if err := fp.Sync(); err != nil {
+		return err
+	}
+	if err := fp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(fp.Name(), target)
 }
 
 func (f *File) LogrusFields() logrus.Fields {

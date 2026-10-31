@@ -63,6 +63,17 @@ func (c *Client) SetLowerLimitDelta(delta int) (string, error) {
 	return c.Put("/lower-limit-delta", strconv.Itoa(delta))
 }
 
+func (c *Client) SetChargeRange(upper, lower int) (string, error) {
+	payload, err := json.Marshal(struct {
+		Upper int `json:"upper"`
+		Lower int `json:"lower"`
+	}{upper, lower})
+	if err != nil {
+		return "", err
+	}
+	return c.Put("/charge-range", string(payload))
+}
+
 func (c *Client) SetPreventIdleSleep(enabled bool) (string, error) {
 	return c.Put("/prevent-idle-sleep", strconv.FormatBool(enabled))
 }

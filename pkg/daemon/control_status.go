@@ -16,9 +16,11 @@ var errLEDReadback = errors.New("MagSafe readback did not match requested state"
 
 var controlState = struct {
 	sync.Mutex
-	tracker   powerinfo.ControlTracker
-	snapshot  powerinfo.ControlStatus
-	suspended bool
+	tracker         powerinfo.ControlTracker
+	snapshot        powerinfo.ControlStatus
+	suspended       bool
+	connectionKnown bool
+	connected       bool
 }{}
 var statusLED ledController
 
@@ -85,6 +87,9 @@ func refreshControlStatus() {
 	if statusLED.hasFailed() {
 		snapshot.LED.Available = false
 		snapshot.LED.Reason = "write_failed"
+		if statusLED.hasPendingRelease() {
+			snapshot.LED.Reason = "release_failed"
+		}
 		snapshot.LED.Desired = "system"
 	}
 	controlState.snapshot = snapshot
@@ -110,5 +115,28 @@ func suspendControlStatus(suspended bool) {
 	controlState.snapshot.SampledAt = time.Time{}
 	if smcConn != nil {
 		statusLED.apply(smc.LEDSystem, false, smcConn.SetMagSafeLedState, smcConn.GetMagSafeLedState)
+	}
+}
+
+// Invalidate synchronously at the mutation boundary, including changes away
+// and back between polling samples. Do not change the actual sleep state.
+func invalidateControlStatus() {
+	controlState.Lock()
+	defer controlState.Unlock()
+	controlState.tracker.Reset()
+	controlState.snapshot.State, controlState.snapshot.Reason = "unknown", "data_unavailable"
+	controlState.snapshot.SampledAt = time.Time{}
+	if smcConn != nil {
+		statusLED.apply(smc.LEDSystem, false, smcConn.SetMagSafeLedState, smcConn.GetMagSafeLedState)
+	}
+}
+
+func observePowerConnection(connected bool) {
+	controlState.Lock()
+	changed := !controlState.connectionKnown || controlState.connected != connected
+	controlState.connectionKnown, controlState.connected = true, connected
+	controlState.Unlock()
+	if changed {
+		invalidateControlStatus()
 	}
 }

@@ -372,6 +372,9 @@ func (c *menuController) updateTelemetry() {
 		return
 	}
 	if telemetry.Control != nil {
+		if !telemetry.Control.LED.Available {
+			c.menu.setHidden(itemMagSafe, true)
+		}
 		c.menu.setTitle(itemState, controlStatusTitle(telemetry.Control))
 		c.menu.setTitle(itemLEDStatus, ledStatusTitle(telemetry.Control.LED))
 		c.menu.setControlState(telemetry.Control.State, controlStatusTitle(telemetry.Control))

@@ -54,7 +54,11 @@ func setChargeRange(c *gin.Context) {
 		if !oldUntil.IsZero() {
 			conf.SetDisableTimer(oldUntil, oldPre)
 		}
-		conf.SetChargeOnceTarget(oldTarget)
+		if oldTarget == 0 {
+			conf.ClearChargeOnceTarget()
+		} else {
+			conf.SetChargeOnceTarget(oldTarget)
+		}
 	}
 	conf.SetChargeRange(upper, lower)
 	conf.ClearDisableTimer()
@@ -66,6 +70,7 @@ func setChargeRange(c *gin.Context) {
 		return
 	}
 	maintainLoopInnerLock.Unlock()
+	invalidateControlStatus()
 	if !maintainLoopForced() {
 		maintainLoopInnerLock.Lock()
 		restore()

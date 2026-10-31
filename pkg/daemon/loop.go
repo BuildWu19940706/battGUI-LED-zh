@@ -144,6 +144,7 @@ func restoreDisabledLimit(conf config.Config, now time.Time) bool {
 		logrus.Errorf("saveConfig failed: %v", err)
 	}
 
+	invalidateControlStatus()
 	logrus.WithField("limit", limit).Infof("disable duration elapsed, charge limit restored")
 
 	return true

@@ -148,6 +148,7 @@ func Run(configPath string, unixSocketPath string, allowNonRoot bool) error {
 			chargeControlTransitionMu.Lock()
 			err := conf.Load()
 			if err == nil {
+				invalidateControlStatus()
 				disableUnsupportedConfiguredFeatures()
 				err = reconcileReloadedSleepPolicy()
 			}

@@ -226,5 +226,13 @@ func requireCapability(c *gin.Context, feature compatibility.Feature) bool {
 }
 
 func getCompatibility(c *gin.Context) {
-	c.IndentedJSON(http.StatusOK, getCapabilities())
+	caps := getCapabilities()
+	if statusLED.hasFailed() {
+		caps.MagSafeLED = false
+		caps.MagSafeLEDReason = "write_failed"
+		if statusLED.hasPendingRelease() {
+			caps.MagSafeLEDReason = "release_failed"
+		}
+	}
+	c.IndentedJSON(http.StatusOK, caps)
 }

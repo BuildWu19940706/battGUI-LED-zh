@@ -34,6 +34,8 @@ func controlStatusTitle(status *powerinfo.ControlStatus) string {
 func ledStatusTitle(status powerinfo.LEDStatus) string {
 	message := "System controlled"
 	switch {
+	case status.Reason == "release_failed":
+		message = "LED release failed; system control could not be confirmed"
 	case status.Reason == "write_failed":
 		message = "Control failed; returned to system"
 	case status.Reason == "firmware_unverified":

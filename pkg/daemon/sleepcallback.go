@@ -137,6 +137,12 @@ func systemWillPowerOnCallback() {
 	// System has started the wake-up process...
 }
 
+//export powerSourceChangedCallback
+func powerSourceChangedCallback(connected C.int) { observePowerConnection(connected != 0) }
+
+//export powerAdapterChangedCallback
+func powerAdapterChangedCallback() { invalidateControlStatus() }
+
 //export systemHasPoweredOnCallback
 func systemHasPoweredOnCallback() {
 	suspendControlStatus(false)

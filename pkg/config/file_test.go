@@ -10,6 +10,38 @@ import (
 	"github.com/charlie0129/batt/pkg/utils/ptr"
 )
 
+func TestConcurrentChargeRangeReadersComplete(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "batt.json")
+	file, err := NewFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start, done := make(chan struct{}), make(chan struct{}, 2)
+	go func() {
+		<-start
+		for i := 0; i < 10000; i++ {
+			file.SetChargeRange(80, 78)
+			file.SetChargeRange(70, 60)
+		}
+		done <- struct{}{}
+	}()
+	go func() {
+		<-start
+		for i := 0; i < 10000; i++ {
+			_ = file.LowerLimit()
+		}
+		done <- struct{}{}
+	}()
+	close(start)
+	for i := 0; i < 2; i++ {
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("a queued writer deadlocked a nested range read")
+		}
+	}
+}
+
 func TestAdapterDisableTimerPersists(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "batt.json")
 	configured, err := NewFile(path)

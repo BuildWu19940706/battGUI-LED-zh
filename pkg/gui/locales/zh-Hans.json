@@ -178,5 +178,6 @@
   "ScheduleDisable": "关闭校准计划",
   "ScheduleSkip": "跳过本次校准",
   "SchedulePostpone": "推迟校准",
-  "ScheduleError": "校准计划出错"
+  "ScheduleError": "校准计划出错",
+  "LED release failed; system control could not be confirmed": "指示灯恢复失败，尚未确认已交回系统"
 }

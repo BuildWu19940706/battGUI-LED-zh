@@ -3,6 +3,8 @@
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
+#include <pthread.h>
 
 #include <mach/mach_init.h>
 #include <mach/mach_interface.h>
@@ -10,6 +12,8 @@
 
 #include <IOKit/IOMessage.h>
 #include <IOKit/pwr_mgt/IOPMLib.h>
+#include <IOKit/ps/IOPowerSources.h>
+#include <IOKit/ps/IOPSKeys.h>
 
 #include "hook.h"
 
@@ -19,6 +23,30 @@ IONotificationPortRef notifyPortRef;
 // notifier object, used to deregister later
 io_object_t notifierObject;
 long gMessageArgument;
+static CFRunLoopSourceRef powerSourceNotification;
+static CFRunLoopRef notificationRunLoop;
+static CFDictionaryRef previousAdapterDetails;
+static pthread_mutex_t powerSourceMutex = PTHREAD_MUTEX_INITIALIZER;
+static bool powerSourceStopped;
+
+static void powerSourceCallback(void *context) {
+    pthread_mutex_lock(&powerSourceMutex);
+    if (powerSourceStopped) { pthread_mutex_unlock(&powerSourceMutex); return; }
+    CFTypeRef info = IOPSCopyPowerSourcesInfo();
+    if (info == NULL) { pthread_mutex_unlock(&powerSourceMutex); return; }
+    CFStringRef source = IOPSGetProvidingPowerSourceType(info);
+    if (source != NULL) powerSourceChangedCallback(CFEqual(source, CFSTR(kIOPSACPowerValue)) ? 1 : 0);
+    // Switching between MagSafe and USB-C can keep the Mac on AC power.
+    // Treat an adapter-identity/negotiation change as a fresh connection too.
+    CFDictionaryRef adapter = IOPSCopyExternalPowerAdapterDetails();
+    Boolean changed = (adapter == NULL) != (previousAdapterDetails == NULL);
+    if (adapter != NULL && previousAdapterDetails != NULL && !CFEqual(adapter, previousAdapterDetails)) changed = true;
+    if (changed) powerAdapterChangedCallback();
+    if (previousAdapterDetails != NULL) CFRelease(previousAdapterDetails);
+    previousAdapterDetails = adapter;
+    CFRelease(info);
+    pthread_mutex_unlock(&powerSourceMutex);
+}
 
 int AllowPowerChange()
 {
@@ -90,7 +118,7 @@ void sleepCallBack(void* refCon, io_service_t service, natural_t messageType, vo
 int ListenNotifications()
 {
     // this parameter is passed to the callback
-    void* refCon;
+    void* refCon = NULL;
 
     // register to receive system sleep notifications
     root_port = IORegisterForSystemPower(refCon, &notifyPortRef, sleepCallBack, &notifierObject);
@@ -102,6 +130,12 @@ int ListenNotifications()
     // add the notification port to the application runloop
     CFRunLoopAddSource(CFRunLoopGetCurrent(),
         IONotificationPortGetRunLoopSource(notifyPortRef), kCFRunLoopCommonModes);
+    notificationRunLoop = CFRunLoopGetCurrent();
+    CFRetain(notificationRunLoop);
+    powerSourceStopped = false;
+    powerSourceNotification = IOPSNotificationCreateRunLoopSource(powerSourceCallback, NULL);
+    if (powerSourceNotification != NULL) CFRunLoopAddSource(notificationRunLoop, powerSourceNotification, kCFRunLoopCommonModes);
+    powerSourceCallback(NULL);
 
     // Start the run loop to receive sleep notifications.
     CFRunLoopRun();
@@ -113,7 +147,15 @@ int ListenNotifications()
 int StopListeningNotifications()
 {
     // remove the sleep notification port from the application runloop
-    CFRunLoopRemoveSource(CFRunLoopGetCurrent(),
+    if (notificationRunLoop == NULL) return 0;
+    pthread_mutex_lock(&powerSourceMutex);
+    powerSourceStopped = true;
+    if (powerSourceNotification != NULL) {
+        CFRunLoopRemoveSource(notificationRunLoop, powerSourceNotification, kCFRunLoopCommonModes);
+        CFRelease(powerSourceNotification);
+        powerSourceNotification = NULL;
+    }
+    CFRunLoopRemoveSource(notificationRunLoop,
        IONotificationPortGetRunLoopSource(notifyPortRef),
        kCFRunLoopCommonModes);
 
@@ -126,6 +168,11 @@ int StopListeningNotifications()
 
     // destroy the notification port allocated by IORegisterForSystemPower
     IONotificationPortDestroy(notifyPortRef);
+    if (previousAdapterDetails != NULL) { CFRelease(previousAdapterDetails); previousAdapterDetails = NULL; }
+    pthread_mutex_unlock(&powerSourceMutex);
+    CFRunLoopStop(notificationRunLoop);
+    CFRelease(notificationRunLoop);
+    notificationRunLoop = NULL;
 
     return 0;
 }

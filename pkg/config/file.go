@@ -203,7 +203,13 @@ func (f *File) LowerLimit() int {
 		delta = *defaultFileConfig.LowerLimitDelta
 	}
 
-	return f.UpperLimit() - delta
+	// RWMutex read locks are not recursive when a writer is queued. Read both
+	// members in this one critical section instead of calling UpperLimit().
+	upper := *defaultFileConfig.Limit
+	if f.c.Limit != nil {
+		upper = *f.c.Limit
+	}
+	return upper - delta
 }
 
 func (f *File) PreventIdleSleep() bool {

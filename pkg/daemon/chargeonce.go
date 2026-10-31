@@ -137,11 +137,13 @@ func startChargeOnce(target, charge int) error {
 		return err
 	}
 
+	invalidateControlStatus()
 	return nil
 }
 
 // reportChargeOnceStarted runs only after the immediate enforcement succeeds.
 func reportChargeOnceStarted(target, charge int) {
+	invalidateControlStatus()
 	logrus.WithFields(logrus.Fields{
 		"target":             target,
 		"charge":             charge,
@@ -167,6 +169,7 @@ func cancelChargeOnce() (int, error) {
 		return 0, err
 	}
 
+	invalidateControlStatus()
 	logrus.WithFields(logrus.Fields{
 		"target":             target,
 		chargeOnceLimitField: conf.UpperLimit(),
@@ -232,6 +235,7 @@ func completeChargeOnce(conf config.Config) bool {
 		return false
 	}
 
+	invalidateControlStatus()
 	logrus.WithFields(logrus.Fields{
 		"target":             target,
 		"charge":             charge,

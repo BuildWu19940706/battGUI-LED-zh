@@ -20,6 +20,8 @@ import (
 )
 
 func getConfig(c *gin.Context) {
+	chargeControlTransitionMu.Lock()
+	defer chargeControlTransitionMu.Unlock()
 	fc, err := config.NewRawFileConfigFromConfig(conf)
 	if err != nil {
 		_ = c.AbortWithError(http.StatusInternalServerError, err)
@@ -95,6 +97,7 @@ func setLimit(c *gin.Context) {
 		_ = c.AbortWithError(http.StatusInternalServerError, err)
 		return
 	}
+	invalidateControlStatus()
 	reportSupersededChargeOnce(superseded, fmt.Sprintf("charge limit set to %d%%", l))
 
 	logrus.Infof("set charging limit to %d", l)
@@ -211,6 +214,7 @@ func setDisableFor(c *gin.Context) {
 		_ = c.AbortWithError(http.StatusInternalServerError, err)
 		return
 	}
+	invalidateControlStatus()
 	reportSupersededChargeOnce(superseded, "charge limit temporarily disabled")
 
 	logrus.WithFields(logrus.Fields{
@@ -569,6 +573,8 @@ func setLowerLimitDelta(c *gin.Context) {
 	if !requireCapability(c, compatibility.FeatureLowerLimit) {
 		return
 	}
+	chargeControlTransitionMu.Lock()
+	defer chargeControlTransitionMu.Unlock()
 	var d int
 	if err := c.BindJSON(&d); err != nil {
 		c.IndentedJSON(http.StatusBadRequest, err.Error())
@@ -600,6 +606,7 @@ func setLowerLimitDelta(c *gin.Context) {
 
 	ret := fmt.Sprintf("set lower limit delta to %d, current upper/lower limit is %d%%/%d%%", d, conf.UpperLimit(), conf.LowerLimit())
 	logrus.Info(ret)
+	invalidateControlStatus()
 	maintainLoopForced()
 
 	c.IndentedJSON(http.StatusCreated, ret)

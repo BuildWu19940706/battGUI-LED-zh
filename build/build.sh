@@ -55,8 +55,9 @@ printf "# BUILD building for "
 if [ "${DEBUG:-}" != "1" ]; then
   # release build
   # trim paths, disable symbols and DWARF.
-  goasmflags="all=-trimpath=$(pwd)"
-  gogcflags="all=-trimpath=$(pwd)"
+  # go build -trimpath handles workspace paths containing spaces correctly.
+  goasmflags=""
+  gogcflags=""
   goldflags="-s -w"
 
   printf "release...\n"
@@ -83,6 +84,7 @@ export CGO_CFLAGS="-O2"
 export CGO_LDFLAGS="-O2"
 
 go build \
+  -trimpath \
   -gcflags="${gogcflags}" \
   -tags="${GOTAGS:-}" \
   -asmflags="${goasmflags}" \

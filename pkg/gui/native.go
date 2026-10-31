@@ -58,6 +58,8 @@ const (
 	itemUninstall                    menuItem = C.BattItemUninstall
 	itemDisableLimit                 menuItem = C.BattItemDisableLimit
 	itemQuit                         menuItem = C.BattItemQuit
+	itemChargeRange                  menuItem = C.BattItemChargeRange
+	itemLEDStatus                    menuItem = C.BattItemLEDStatus
 )
 
 const (
@@ -149,13 +151,13 @@ func (m *nativeMenu) close() {
 }
 
 func (m *nativeMenu) setTitle(item menuItem, title string) {
-	withCString(title, func(value *C.char) {
+	withCString(tr(title), func(value *C.char) {
 		C.batt_menu_set_title(m.ref, C.int(item), value)
 	})
 }
 
 func (m *nativeMenu) setTooltip(item menuItem, tooltip string) {
-	withCString(tooltip, func(value *C.char) {
+	withCString(tr(tooltip), func(value *C.char) {
 		C.batt_menu_set_tooltip(m.ref, C.int(item), value)
 	})
 }
@@ -195,9 +197,27 @@ func terminateNativeApp() {
 }
 
 func showAlert(message, body string) {
-	withTwoCStrings(message, body, func(cMessage, cBody *C.char) {
+	withTwoCStrings(tr(message), tr(body), func(cMessage, cBody *C.char) {
 		C.batt_show_alert(cMessage, cBody)
 	})
+}
+
+func preferredLanguage() string {
+	value := C.batt_preferred_language()
+	defer C.free(unsafe.Pointer(value))
+	return C.GoString(value)
+}
+func configureNativeLocalization(resource string) {
+	withCString(resource, func(value *C.char) { C.batt_configure_localization(value) })
+}
+func showChargeRange(upper, lower int, status, led string) (int, int, bool) {
+	u, l := C.int(upper), C.int(lower)
+	ok := false
+	withTwoCStrings(status, led, func(s, d *C.char) { ok = bool(C.batt_show_charge_range(&u, &l, s, d)) })
+	return int(u), int(l), ok
+}
+func (m *nativeMenu) setControlState(state, description string) {
+	withTwoCStrings(state, description, func(s, d *C.char) { C.batt_menu_set_control_state(m.ref, s, d) })
 }
 
 func showConfirmation(kind confirmation) bool {
@@ -205,7 +225,7 @@ func showConfirmation(kind confirmation) bool {
 }
 
 func showNotification(title, body string) {
-	withTwoCStrings(title, body, func(cTitle, cBody *C.char) {
+	withTwoCStrings(tr(title), tr(body), func(cTitle, cBody *C.char) {
 		C.batt_show_notification(cTitle, cBody)
 	})
 }

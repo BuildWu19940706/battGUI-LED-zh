@@ -64,6 +64,8 @@ typedef enum {
     BattItemDisableLimit3Days,
     BattItemDisableLimit7Days,
     BattItemQuit,
+    BattItemChargeRange,
+    BattItemLEDStatus,
 } BattMenuItem;
 
 typedef enum {
@@ -85,6 +87,10 @@ void batt_menu_set_enabled(BattMenuRef menu, int item, bool enabled);
 void batt_menu_set_checked(BattMenuRef menu, int item, bool checked);
 void batt_menu_set_status_icon(BattMenuRef menu, bool installed, bool capable, bool needs_upgrade);
 void batt_menu_set_power(BattMenuRef menu, int item, const char *label, double value);
+void batt_menu_set_control_state(BattMenuRef menu, const char *state, const char *description);
+char *batt_preferred_language(void);
+void batt_configure_localization(const char *json);
+bool batt_show_charge_range(int *upper, int *lower, const char *status, const char *led);
 
 void batt_show_alert(const char *message, const char *body);
 bool batt_show_confirmation(int confirmation);

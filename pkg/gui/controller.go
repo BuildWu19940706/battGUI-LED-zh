@@ -24,6 +24,7 @@ type menuController struct {
 	calibrationPhase        calibration.Phase
 	capabilities            compatibility.Capabilities
 	compatibilityKnown      bool
+	rangeEditable           bool
 	upperLimit              int
 	currentCharge           int
 	chargeOnceTarget        int
@@ -40,7 +41,7 @@ func (c *menuController) onWillOpen() {
 }
 
 func (c *menuController) onTimerTick() {
-	c.refreshDisableSchedules()
+	c.refreshOnOpen()
 	c.updateTelemetry()
 }
 
@@ -48,7 +49,7 @@ func (c *menuController) refreshCompatibility() {
 	logrus.Info("Getting config")
 	rawConfig, err := c.api.GetConfig()
 	if err != nil {
-		logrus.WithError(err).Warn("Failed to get config")
+		logrus.WithError(err).Warn(tr("Failed to get config"))
 		c.setCompatibility(false, compatibility.Permissive(), false)
 		return
 	}
@@ -69,7 +70,7 @@ func (c *menuController) refreshCompatibility() {
 	logrus.Info("Getting daemon version")
 	daemonVersion, err := c.api.GetVersion()
 	if err != nil {
-		logrus.WithError(err).Warn("Failed to get version")
+		logrus.WithError(err).Warn(tr("Failed to get version"))
 		c.setCompatibility(true, *capabilities, true)
 	} else {
 		c.setCompatibility(true, *capabilities, daemonVersion != version.Version)
@@ -83,7 +84,7 @@ func (c *menuController) refreshCompatibility() {
 func (c *menuController) refreshOnOpen() {
 	rawConfig, err := c.api.GetConfig()
 	if err != nil {
-		logrus.WithError(err).Error("Failed to get config")
+		logrus.WithError(err).Error(tr("Failed to get config"))
 		c.setCompatibility(false, compatibility.Permissive(), false)
 		return
 	}
@@ -100,7 +101,7 @@ func (c *menuController) refreshOnOpen() {
 	}
 	daemonVersion, err := c.api.GetVersion()
 	if err != nil {
-		logrus.WithError(err).Error("Failed to get version")
+		logrus.WithError(err).Error(tr("Failed to get version"))
 		c.setCompatibility(true, *capabilities, true)
 	} else {
 		c.setCompatibility(true, *capabilities, daemonVersion != version.Version)
@@ -112,50 +113,50 @@ func (c *menuController) refreshOnOpen() {
 
 	isPluggedIn, err := c.api.GetPluggedIn()
 	if err != nil {
-		c.setStateError("Failed to get plugged in state", err)
+		c.setStateError(tr("Failed to get plugged in state"), err)
 		return
 	}
 	currentCharge, err := c.api.GetCurrentCharge()
 	if err != nil {
-		c.setStateError("Failed to get current charge", err)
+		c.setStateError(tr("Failed to get current charge"), err)
 		return
 	}
 	batteryInfo, err := c.api.GetBatteryInfo()
 	if err != nil {
-		c.setStateError("Failed to get battery info", err)
+		c.setStateError(tr("Failed to get battery info"), err)
 		return
 	}
 	allowsCharging := batteryInfo.State == powerinfo.Charging
 	if capabilities.ChargeControlMode == compatibility.ChargeControlLegacy {
 		allowsCharging, err = c.api.GetCharging()
 		if err != nil {
-			c.setStateError("Failed to get charging state", err)
+			c.setStateError(tr("Failed to get charging state"), err)
 			return
 		}
 	}
 
 	c.calibrationThreshold = conf.CalibrationDischargeThreshold()
 	c.updateChargeOnce(conf, currentCharge)
-	c.menu.setTitle(itemCurrentLimit, fmt.Sprintf("Current Limit: %d%%", conf.UpperLimit()))
+	c.menu.setTitle(itemCurrentLimit, fmt.Sprintf(tr("Current Limit: %d%%"), conf.UpperLimit()))
 	for _, item := range quickLimitItems {
 		c.menu.setChecked(item, quickLimitForItem(item) == conf.UpperLimit())
 	}
 
-	state := "Not Charging"
+	state := tr("Not Charging")
 	switch batteryInfo.State {
 	case powerinfo.Charging:
-		state = "Charging"
+		state = tr("Charging")
 	case powerinfo.Discharging:
 		if batteryInfo.ChargeRate != 0 {
-			state = "Discharging"
+			state = tr("Discharging")
 		}
 	case powerinfo.Full:
-		state = "Full"
+		state = tr("Full")
 	}
 	if capabilities.ChargeControlMode == compatibility.ChargeControlLegacy && !allowsCharging && isPluggedIn && conf.UpperLimit() < 100 && currentCharge < conf.LowerLimit() {
-		state = "Will Charge Soon"
+		state = tr("Will Charge Soon")
 	}
-	c.menu.setTitle(itemState, "State: "+state)
+	c.menu.setTitle(itemState, tr("State: ")+state)
 
 	c.updateMagSafeChecks(conf.ControlMagSafeLED())
 	c.menu.setChecked(itemPreventIdleSleep, conf.PreventIdleSleep())
@@ -166,7 +167,7 @@ func (c *menuController) refreshOnOpen() {
 		if adapter, err := c.api.GetAdapter(); err == nil {
 			c.updateAdapterState(adapter)
 		} else {
-			logrus.WithError(err).Error("Failed to get adapter")
+			logrus.WithError(err).Error(tr("Failed to get adapter"))
 			c.adapterKnown = false
 			if c.compatibilityKnown {
 				c.menu.setEnabled(itemForceDischarge, false)
@@ -301,7 +302,7 @@ func (c *menuController) updateForceDischargeControls() {
 
 func (c *menuController) setStateError(message string, err error) {
 	logrus.WithError(err).Error(message)
-	c.menu.setTitle(itemState, "State: Error")
+	c.menu.setTitle(itemState, tr("State: Error"))
 }
 
 func canShowPreventSleepOnAdapterDisable(installed bool, capabilities compatibility.Capabilities, needsUpgrade bool) bool {
@@ -316,6 +317,14 @@ func (c *menuController) setCompatibility(installed bool, capabilities compatibi
 	c.menu.setStatusIcon(installed, capabilities.ChargingControl, needsUpgrade)
 
 	usable := installed && capabilities.ChargingControl && !needsUpgrade
+	c.rangeEditable = usable && capabilities.ChargeRange
+	c.menu.setHidden(itemChargeRange, !installed || !capabilities.ChargingControl)
+	c.menu.setEnabled(itemChargeRange, c.rangeEditable)
+	c.menu.setTooltip(itemChargeRange, tr("Upgrade the daemon to edit both limits together."))
+	if c.rangeEditable {
+		c.menu.setTooltip(itemChargeRange, tr("Charging pauses at the upper limit and resumes below the lower limit."))
+	}
+	c.menu.setHidden(itemLEDStatus, !installed || !capabilities.ChargingControl)
 	c.menu.setHidden(itemPowerFlow, !usable)
 	c.menu.setHidden(itemInstall, installed)
 	c.menu.setHidden(itemUpgrade, !installed || (!needsUpgrade && capabilities.ChargingControl))
@@ -355,16 +364,26 @@ func (c *menuController) setCompatibility(installed bool, capabilities compatibi
 func (c *menuController) updateTelemetry() {
 	telemetry, err := c.api.GetTelemetry(true, true)
 	if err != nil || telemetry == nil {
+		c.menu.setControlState("unknown", tr("State: Unknown"))
+		c.menu.setTitle(itemLEDStatus, tr("LED control unavailable"))
 		if err != nil {
 			logrus.WithError(err).Debug("GetTelemetry failed")
 		}
 		return
 	}
+	if telemetry.Control != nil {
+		c.menu.setTitle(itemState, controlStatusTitle(telemetry.Control))
+		c.menu.setTitle(itemLEDStatus, ledStatusTitle(telemetry.Control.LED))
+		c.menu.setControlState(telemetry.Control.State, controlStatusTitle(telemetry.Control))
+	} else {
+		c.menu.setControlState("unknown", "batt")
+		c.menu.setTitle(itemLEDStatus, ledStatusTitle(powerinfo.LEDStatus{Available: c.capabilities.MagSafeLED, Reason: c.capabilities.MagSafeLEDReason}))
+	}
 	if telemetry.Power != nil {
 		calculations := telemetry.Power.Calculations
-		c.menu.setPower(itemPowerSystem, "System", calculations.SystemPower)
-		c.menu.setPower(itemPowerAdapter, "Adapter", calculations.ACPower)
-		c.menu.setPower(itemPowerBattery, "Battery", calculations.BatteryPower)
+		c.menu.setPower(itemPowerSystem, tr("System"), calculations.SystemPower)
+		c.menu.setPower(itemPowerAdapter, tr("Adapter"), calculations.ACPower)
+		c.menu.setPower(itemPowerBattery, tr("Battery"), calculations.BatteryPower)
 	}
 	if telemetry.Calibration != nil {
 		c.updateCalibration(telemetry.Calibration)
@@ -376,11 +395,11 @@ func (c *menuController) updateCalibration(status *calibration.Status) {
 	isIdle := status.Phase == calibration.PhaseIdle
 	switch {
 	case isIdle:
-		c.menu.setTitle(itemAutoCalibration, "Auto Calibration (Experimental)...")
+		c.menu.setTitle(itemAutoCalibration, tr("Auto Calibration (Experimental)..."))
 	case status.Paused:
-		c.menu.setTitle(itemAutoCalibration, "Auto Calibration (Experimental) Paused...")
+		c.menu.setTitle(itemAutoCalibration, tr("Auto Calibration (Experimental) Paused..."))
 	default:
-		c.menu.setTitle(itemAutoCalibration, "Auto Calibration (Experimental) In Progress...")
+		c.menu.setTitle(itemAutoCalibration, tr("Auto Calibration (Experimental) In Progress..."))
 	}
 
 	c.menu.setEnabled(itemCalibrationStart, canStartCalibration(status.Phase, c.disableScheduled, c.adapterDisableScheduled))
@@ -400,6 +419,7 @@ func (c *menuController) updateCalibration(status *calibration.Status) {
 	for _, item := range quickLimitItems {
 		c.menu.setEnabled(item, canSetChargeLimit(status.Phase))
 	}
+	c.menu.setEnabled(itemChargeRange, c.rangeEditable && canSetChargeLimit(status.Phase))
 	// A persisted conflict may contain both states after a restart. Keep the
 	// submenu openable only to show its countdown; its actions remain disabled.
 	c.menu.setEnabled(itemDisableLimit, canOpenDisableLimitMenu(status.Phase, c.disableScheduled))
@@ -484,28 +504,28 @@ func canStartForceDischarge(phase calibration.Phase, adapterDisableScheduled boo
 func (c *menuController) calibrationStatusTitle(status *calibration.Status) (string, bool) {
 	switch status.Phase {
 	case calibration.PhaseIdle:
-		return "Status: Idle", true
+		return tr("Status: Idle"), true
 	case calibration.PhaseDischarge:
-		return fmt.Sprintf("Status: Discharging (%d%% → %d%%)", status.ChargePercent, c.calibrationThreshold), true
+		return fmt.Sprintf(tr("Status: Discharging (%d%% → %d%%)"), status.ChargePercent, c.calibrationThreshold), true
 	case calibration.PhaseCharge:
-		return fmt.Sprintf("Status: Charging (%d%% → 100%%)", status.ChargePercent), true
+		return fmt.Sprintf(tr("Status: Charging (%d%% → 100%%)"), status.ChargePercent), true
 	case calibration.PhaseHold:
 		hours := status.RemainingHoldSecs / 3600
 		minutes := (status.RemainingHoldSecs % 3600) / 60
 		seconds := status.RemainingHoldSecs % 60
-		return fmt.Sprintf("Status: Holding (%02d:%02d:%02d left)", hours, minutes, seconds), true
+		return fmt.Sprintf(tr("Status: Holding (%02d:%02d:%02d left)"), hours, minutes, seconds), true
 	case calibration.PhasePostHold:
 		if status.TargetPercent > 0 {
-			return fmt.Sprintf("Status: Discharging (%d%% → %d%%)", status.ChargePercent, status.TargetPercent), true
+			return fmt.Sprintf(tr("Status: Discharging (%d%% → %d%%)"), status.ChargePercent, status.TargetPercent), true
 		}
-		return "Status: Discharging to previous limit...", true
+		return tr("Status: Discharging to previous limit..."), true
 	case calibration.PhaseRestore:
-		return "Status: Restoring settings...", true
+		return tr("Status: Restoring settings..."), true
 	case calibration.PhaseError:
 		if status.Message != "" {
-			return "Status: Error - " + status.Message, true
+			return tr("Status: Error - ") + status.Message, true
 		}
-		return "Status: Error", true
+		return tr("Status: Error"), true
 	default:
 		return "", false
 	}

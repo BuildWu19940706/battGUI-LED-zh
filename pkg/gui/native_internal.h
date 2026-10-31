@@ -2,6 +2,8 @@
 
 #include "native.h"
 
+NSString *BattLocalized(NSString *message);
+
 @interface BattMenuController : NSObject <NSMenuDelegate>
 @property(nonatomic, assign) uintptr_t handle;
 @property(nonatomic, retain) NSStatusItem *statusItem;

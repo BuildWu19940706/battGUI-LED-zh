@@ -2,6 +2,7 @@ package gui
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/sirupsen/logrus"
 
@@ -23,7 +24,14 @@ func (c *menuController) subscribeEvents(ctx context.Context) {
 				logrus.WithError(err).Error("failed to decode calibration.action event")
 				continue
 			}
-			showNotification("Calibration", payload.Message)
+			body := payload.Message
+			if activeLocale == "zh-Hans" {
+				body = fmt.Sprintf(tr("Calibration action: %s"), tr(payload.Action))
+				if payload.Action == "ScheduleError" {
+					body += "\n" + payload.Message
+				}
+			}
+			showNotification("Calibration", body)
 		case events.CalibrationPhase:
 			payload, err := events.DecodeAs[events.CalibrationPhaseEvent](event)
 			if err != nil {
@@ -31,7 +39,14 @@ func (c *menuController) subscribeEvents(ctx context.Context) {
 				continue
 			}
 			if calibrationPhaseNotifies(calibration.Phase(payload.To)) {
-				showNotification("Calibration", payload.Message)
+				body := payload.Message
+				if activeLocale == "zh-Hans" {
+					body = fmt.Sprintf(tr("Calibration phase: %s"), tr(payload.To))
+					if payload.To == "Error" {
+						body += "\n" + payload.Message
+					}
+				}
+				showNotification("Calibration", body)
 			}
 		case events.ChargeOnceAction:
 			payload, err := events.DecodeAs[events.ChargeOnceActionEvent](event)
@@ -39,7 +54,18 @@ func (c *menuController) subscribeEvents(ctx context.Context) {
 				logrus.WithError(err).Error("failed to decode charge-once.action event")
 				continue
 			}
-			showNotification("One-Time Charge", payload.Message)
+			body := payload.Message
+			if activeLocale == "zh-Hans" {
+				switch payload.Action {
+				case "Start":
+					body = fmt.Sprintf(tr("One-time charge to %d%% started."), payload.Target)
+				case "Cancel":
+					body = tr("One-time charge cancelled. Your normal charge limit applies again.")
+				case "Complete":
+					body = tr("One-time charge completed. Your normal charge limit applies again.")
+				}
+			}
+			showNotification("One-Time Charge", body)
 		}
 	}
 }

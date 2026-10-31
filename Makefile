@@ -37,9 +37,10 @@ lint:
 app: build
 	rm -rf bin/batt.app
 	cp -r hack/boilerplates/batt.app bin
-	export version=$$(echo "$(VERSION)" | sed 's/v//g') && sed -i '' "s|BATT_VERSION|$$version|g" bin/batt.app/Contents/Info.plist
+	export version=$$(echo "$(VERSION)" | sed -E 's/^v//;s/[-+].*//') && sed -i '' "s|BATT_VERSION|$$version|g" bin/batt.app/Contents/Info.plist
 	mkdir -p bin/batt.app/Contents/MacOS
 	cp bin/batt bin/batt.app/Contents/MacOS/batt
+	cp pkg/gui/locales/zh-Hans.json bin/batt.app/Contents/Resources/zh-Hans.json
 
 dmg: app
 	cd bin && create-dmg --volname batt --app-drop-link 360 130 --icon batt 130 130 --format ULMO "batt-$(VERSION).dmg" batt.app

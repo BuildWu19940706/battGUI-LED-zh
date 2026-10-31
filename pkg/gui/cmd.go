@@ -32,6 +32,7 @@ This command should not be called directly by the user. Users should use the .ap
 }
 
 func Run(unixSocketPath string) {
+	configureLocalization(preferredLanguage())
 	logrus.WithFields(logrus.Fields{
 		"version":   version.Version,
 		"gitCommit": version.GitCommit,

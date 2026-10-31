@@ -1,9 +1,14 @@
 package daemon
 
 import (
+	"bytes"
 	"errors"
-	"github.com/charlie0129/batt/pkg/smc"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/charlie0129/batt/pkg/smc"
+	"github.com/sirupsen/logrus"
 )
 
 func TestLEDWritesAreDeduplicatedAndRelease(t *testing.T) {
@@ -77,4 +82,99 @@ func TestLEDFailedReleaseCanRecoverWithoutColors(t *testing.T) {
 func TestLEDUnsupportedDoesNotWrite(t *testing.T) {
 	c := ledController{}
 	c.apply(smc.LEDGreen, false, func(s smc.MagSafeLedState) error { t.Fatal("unverified hardware written"); return nil }, nil)
+}
+
+// Regression: the M4 returns the previous color for about 50ms after a
+// successful write. Checking only the first read falsely disables the session.
+func TestLEDDelayedReadbackDoesNotDisableSession(t *testing.T) {
+	for _, target := range []smc.MagSafeLedState{smc.LEDGreen, smc.LEDOrange, smc.LEDOff} {
+		t.Run(targetName(target), func(t *testing.T) {
+			c := ledController{known: true, last: smc.LEDSystem}
+			previous := smc.LEDOrange
+			if target == smc.LEDOrange {
+				previous = smc.LEDGreen
+			}
+			var writes []smc.MagSafeLedState
+			write := func(state smc.MagSafeLedState) error {
+				writes = append(writes, state)
+				return nil
+			}
+			reads := 0
+			read := func() (smc.MagSafeLedState, error) {
+				reads++
+				if reads < 3 {
+					return previous, nil
+				}
+				return target, nil
+			}
+			c.apply(target, true, write, read)
+			if c.hasFailed() || c.hasPendingRelease() || c.last != target || !c.owned {
+				t.Fatalf("valid delayed color was rejected: failed=%v last=%d owned=%v", c.failed, c.last, c.owned)
+			}
+			if reads != 3 {
+				t.Fatalf("did not stop verification at the first matching response: %d reads", reads)
+			}
+			c.apply(target, true, write, read)
+			if len(writes) != 1 || writes[0] != target {
+				t.Fatalf("readback verification rewrote the color: %v", writes)
+			}
+		})
+	}
+}
+
+func targetName(state smc.MagSafeLedState) string {
+	switch state {
+	case smc.LEDGreen:
+		return "green"
+	case smc.LEDOrange:
+		return "orange"
+	default:
+		return "off"
+	}
+}
+
+func TestLEDPersistentMismatchRestoresSystemWithDiagnosticValues(t *testing.T) {
+	var log bytes.Buffer
+	logger := logrus.StandardLogger()
+	previousOutput := logger.Out
+	logger.SetOutput(&log)
+	t.Cleanup(func() { logger.SetOutput(previousOutput) })
+	c := ledController{known: true, last: smc.LEDSystem}
+	var writes []smc.MagSafeLedState
+	write := func(state smc.MagSafeLedState) error { writes = append(writes, state); return nil }
+	reads := 0
+	read := func() (smc.MagSafeLedState, error) { reads++; return smc.LEDOrange, nil }
+	start := time.Now()
+	c.apply(smc.LEDGreen, true, write, read)
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("verification did not finish promptly: %v", elapsed)
+	}
+	c.apply(smc.LEDOrange, true, write, read)
+	if !c.hasFailed() || c.hasPendingRelease() || len(writes) != 2 || writes[0] != smc.LEDGreen || writes[1] != smc.LEDSystem {
+		t.Fatalf("persistent mismatch did not stop colors and restore system: failed=%v writes=%v", c.failed, writes)
+	}
+	if reads < 2 {
+		t.Fatal("persistent mismatch was declared before allowing hardware to settle")
+	}
+	if !strings.Contains(log.String(), "requested=3") || !strings.Contains(log.String(), "readback=4") {
+		t.Fatalf("failure did not identify the requested and actual colors: %s", log.String())
+	}
+}
+
+func TestLEDReadErrorAfterStaleValueFailsSafely(t *testing.T) {
+	c := ledController{known: true, last: smc.LEDSystem}
+	var writes []smc.MagSafeLedState
+	write := func(state smc.MagSafeLedState) error { writes = append(writes, state); return nil }
+	reads := 0
+	read := func() (smc.MagSafeLedState, error) {
+		reads++
+		if reads == 1 {
+			return smc.LEDOrange, nil
+		}
+		return smc.LEDSystem, errors.New("SMC read unavailable")
+	}
+	c.apply(smc.LEDGreen, true, write, read)
+	if reads != 2 || !c.hasFailed() || c.hasPendingRelease() || len(writes) != 2 || writes[1] != smc.LEDSystem {
+		t.Fatalf("read error during settling did not fail safely: reads=%d failed=%v writes=%v", reads, c.failed, writes)
+	}
 }

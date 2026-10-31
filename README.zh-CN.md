@@ -1,6 +1,6 @@
 # batt 中文核心增强版
 
-版本：`v0.8.0-zh.2`。基于 [charlie0129/batt](https://github.com/charlie0129/batt) 的 `2b9f8b579670b3d07365772f6f8e56b4f53912be`，沿用 GPL-2.0 许可证。
+版本：`v0.8.0-zh.3`。基于 [charlie0129/batt](https://github.com/charlie0129/batt) 的 `2b9f8b579670b3d07365772f6f8e56b4f53912be`，沿用 GPL-2.0 许可证。
 
 ## 使用
 
@@ -25,6 +25,8 @@
 **开启路径：菜单栏 batt → 高级设置 → MagSafe 指示灯 → 启用（固件模式）。**
 
 灯控默认关闭，需要手动启用。它继续使用原有固件限充，不切换成适配器断电模式，也不改变 75%–80% 范围。达到目标且停止充电时亮绿；正在充电、主动放电或校准时亮橙。睡眠、连接变化、未知暂停或读取异常会交回系统控制。正常更新间隔约 10 秒。
+
+`v0.8.0-zh.3` 修复写入后过早校验造成的误停用：实测最初 0–11 毫秒仍返回旧灯色，约 50 毫秒时读回才匹配。后台现在只重复读取，分段等待总计最多 500 毫秒，匹配即结束；持续不匹配仍恢复系统，并在日志中记录期望值与实际读回值。真实写入或读取错误仍立即触发回退，不重复写入颜色。升级并重启后台会清除旧版会话的失败状态，已有启用偏好会保留。
 
 此处确认的是基础管理员读写和实际变色，睡眠、拔插及长时间运行的物理稳定性仍需继续观察。写入或读回失败后会停止彩色控制，并尝试恢复系统；未能确认恢复时会明确提示。
 
@@ -52,7 +54,7 @@ go mod download
 go test ./...
 go test -race ./pkg/daemon ./pkg/client ./pkg/config ./pkg/compatibility ./pkg/powerinfo
 go vet ./...
-make app VERSION=v0.8.0-zh.2
+make app VERSION=v0.8.0-zh.3
 codesign --force --deep --sign - bin/batt.app
 ```
 
@@ -73,4 +75,4 @@ go run ./hack/ledprobe
 - `/telemetry` 新增可选 `control`，包含目标、上下限、当前电量、状态原因、采样时间及灯控状态。`unknown` 或过期的采样不能作为达标依据。
 - 旧 CLI、配置字段及接口继续保留。旧后台缺少新增能力时，GUI 会禁用范围编辑并提示升级。
 
-本次验证见 [固件灯控检查记录](docs/validation/2026-11-01-firmware-led.md)；前版记录保存在 [首次交付检查](docs/validation/2026-11-01-zh-core.md)。
+本次修复见 [读回时序检查记录](docs/validation/2026-11-01-led-readback-timing.md)；固件能力验证见 [固件灯控检查记录](docs/validation/2026-11-01-firmware-led.md)；前版记录保存在 [首次交付检查](docs/validation/2026-11-01-zh-core.md)。

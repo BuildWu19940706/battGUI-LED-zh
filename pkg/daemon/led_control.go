@@ -1,9 +1,12 @@
 package daemon
 
 import (
+	"fmt"
+	"sync"
+	"time"
+
 	"github.com/charlie0129/batt/pkg/smc"
 	"github.com/sirupsen/logrus"
-	"sync"
 )
 
 // One writer owns all daemon LED writes, including sleep and shutdown release.
@@ -46,10 +49,20 @@ func (c *ledController) apply(state smc.MagSafeLedState, available bool, write f
 	}
 	err := write(state)
 	if err == nil && state != smc.LEDSystem && read != nil {
-		var got smc.MagSafeLedState
-		got, err = read()
-		if err == nil && got != state {
-			err = errLEDReadback
+		// Firmware can acknowledge the write before its readback changes. The
+		// verified M4 returned the old color at 0-11ms and the new one at 50ms.
+		// Retry reads only, with at most 500ms of settling waits; never rewrite
+		// colors here. Actual read errors still fail immediately.
+		for _, delay := range [...]time.Duration{0, 25 * time.Millisecond, 25 * time.Millisecond, 50 * time.Millisecond, 150 * time.Millisecond, 250 * time.Millisecond} {
+			if delay > 0 {
+				time.Sleep(delay)
+			}
+			var got smc.MagSafeLedState
+			got, err = read()
+			if err != nil || got == state {
+				break
+			}
+			err = fmt.Errorf("%w: requested=%d readback=%d", errLEDReadback, state, got)
 		}
 	}
 	if err != nil {

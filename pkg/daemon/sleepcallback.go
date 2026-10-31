@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/charlie0129/batt/pkg/config"
 	"github.com/sirupsen/logrus"
 )
 
@@ -75,6 +74,7 @@ func canSystemSleepCallback() {
 
 //export systemWillSleepCallback
 func systemWillSleepCallback() {
+	suspendControlStatus(true)
 	/* The system WILL go to sleep. If you do not call IOAllowPowerChange or
 	   IOCancelPowerChange to acknowledge this message, sleep will be
 	   delayed by 30 seconds.
@@ -125,12 +125,6 @@ func systemWillSleepCallback() {
 			logrus.Errorf("pre-sleep charger.Disable failed: %v", err)
 			return
 		}
-		if conf.ControlMagSafeLED() != config.ControlMagSafeModeDisabled {
-			err = smcConn.DisableMagSafeLed()
-			if err != nil {
-				logrus.Errorf("DisableMagSafeLed failed: %v", err)
-			}
-		}
 	} else {
 		logrus.Debugln("no maintained charging is in progress, allow sleep")
 	}
@@ -145,6 +139,7 @@ func systemWillPowerOnCallback() {
 
 //export systemHasPoweredOnCallback
 func systemHasPoweredOnCallback() {
+	suspendControlStatus(false)
 	// System has finished waking up...
 	logrus.Debugln("received kIOMessageSystemHasPoweredOn notification, system has finished waking up")
 	if !usesActiveChargeControl() {
@@ -170,12 +165,6 @@ func systemHasPoweredOnCallback() {
 			logrus.Debugf("delaying next loop by %d seconds", postSleepLoopDelaySeconds)
 			wg.Add(1)
 			go func() {
-				if conf.DisableChargingPreSleep() && conf.ControlMagSafeLED() != config.ControlMagSafeModeDisabled {
-					err := smcConn.DisableMagSafeLed()
-					if err != nil {
-						logrus.Errorf("DisableMagSafeLed failed: %v", err)
-					}
-				}
 
 				// Use sleep instead of time.After because when the computer sleeps, we
 				// actually want the sleep to prolong as well.

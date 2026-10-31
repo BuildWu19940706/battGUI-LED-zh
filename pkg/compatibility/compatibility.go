@@ -44,11 +44,14 @@ type Capabilities struct {
 	ChargeControlMode ChargeControlMode `json:"chargeControlMode"`
 	// SupportedLimits lists the only upper limits the charge-control backend
 	// accepts, in ascending order. Empty means any limit from 10 to 100.
-	SupportedLimits []int `json:"supportedLimits,omitempty"`
-	SleepHooks      bool  `json:"sleepHooks"`
-	MagSafeLED      bool  `json:"magSafeLED"`
-	AdapterControl  bool  `json:"adapterControl"`
-	Calibration     bool  `json:"calibration"`
+	SupportedLimits     []int  `json:"supportedLimits,omitempty"`
+	SleepHooks          bool   `json:"sleepHooks"`
+	MagSafeLED          bool   `json:"magSafeLED"`
+	MagSafeLEDInterface bool   `json:"magSafeLEDInterface,omitempty"`
+	MagSafeLEDReason    string `json:"magSafeLEDReason,omitempty"`
+	ChargeRange         bool   `json:"chargeRange,omitempty"`
+	AdapterControl      bool   `json:"adapterControl"`
+	Calibration         bool   `json:"calibration"`
 }
 
 // Permissive returns the fallback used by clients talking to an older or

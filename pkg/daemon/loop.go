@@ -10,7 +10,6 @@ import (
 	"github.com/charlie0129/batt/pkg/calibration"
 	"github.com/charlie0129/batt/pkg/compatibility"
 	"github.com/charlie0129/batt/pkg/config"
-	"github.com/charlie0129/batt/pkg/smc"
 )
 
 var (
@@ -45,6 +44,7 @@ func infiniteLoop() {
 			maintainAdapterDisable(conf, now)
 		}
 		maintainLoop()
+		refreshControlStatus()
 		time.Sleep(loopInterval)
 	}
 }
@@ -241,54 +241,6 @@ func handleNoMaintain(isChargingEnabled bool) bool {
 			return false
 		}
 
-		if smcConn.CheckMagSafeExistence() {
-			switch conf.ControlMagSafeLED() {
-			case config.ControlMagSafeModeAlwaysOff:
-				err := smcConn.DisableMagSafeLed()
-				if err != nil {
-					// no fail
-					logrus.Errorf("DisableMagSafeLed failed: %v", err)
-				}
-			default:
-				// Reset MagSafe LED to system state.
-				err = smcConn.SetMagSafeLedState(smc.LEDSystem)
-				if err != nil {
-					// no fail
-					logrus.Errorf("SetMagSafeLedState(LEDSystem) failed: %v", err)
-				}
-			}
-		}
-	}
-
-	if smcConn.CheckMagSafeExistence() {
-		// Set MagSafe LED according to config.
-		currentMagSafeLEDState, err := smcConn.GetMagSafeLedState()
-		if err != nil {
-			// no fail
-			logrus.Errorf("GetMagSafeLedState failed: %v", err)
-		}
-		switch conf.ControlMagSafeLED() {
-		case config.ControlMagSafeModeAlwaysOff:
-			if currentMagSafeLEDState != smc.LEDOff {
-				err := smcConn.DisableMagSafeLed()
-				if err != nil {
-					// no fail
-					logrus.Errorf("DisableMagSafeLed failed: %v", err)
-				}
-			}
-		default:
-			// This applies to both ControlMagSafeModeEnabled and ControlMagSafeModeDisabled
-			// modes. Because in Disabled mode we should not interfere with the LED state,
-			// in Enabled mode we want to show the system state (which is the same as
-			// apple's default behavior when limit=100%).
-			if currentMagSafeLEDState != smc.LEDSystem {
-				err := smcConn.SetMagSafeLedState(smc.LEDSystem)
-				if err != nil {
-					// no fail
-					logrus.Errorf("SetMagSafeLedState(LEDSystem) failed: %v", err)
-				}
-			}
-		}
 	}
 
 	// Calling this multiple times is no-op.
@@ -385,15 +337,6 @@ func handleChargingLogic(ignoreMissedLoops, isChargingEnabled, isPluggedIn bool,
 		}
 		isChargingEnabled = false
 		maintainedChargingInProgress = false
-	}
-
-	switch conf.ControlMagSafeLED() {
-	case config.ControlMagSafeModeAlwaysOff:
-		_ = smcConn.DisableMagSafeLed()
-	case config.ControlMagSafeModeEnabled:
-		updateMagSafeLed(isChargingEnabled)
-	default:
-		// nothing
 	}
 
 	if conf.PreventSystemSleep() {
@@ -557,14 +500,6 @@ func maintainActiveCharging(ignoreMissedLoops bool) bool {
 
 	// If calibration is active, advance it and skip normal maintain logic.
 	if applyCalibrationWithinLoop(batteryCharge) {
-		switch conf.ControlMagSafeLED() {
-		case config.ControlMagSafeModeAlwaysOff:
-			_ = smcConn.DisableMagSafeLed()
-		case config.ControlMagSafeModeEnabled:
-			updateMagSafeLed(isChargingEnabled)
-		default:
-			// nothing
-		}
 		return true
 	}
 
@@ -591,13 +526,6 @@ func maintainActiveCharging(ignoreMissedLoops bool) bool {
 	}
 
 	return handleChargingLogic(ignoreMissedLoops, isChargingEnabled, isPluggedIn, batteryCharge, lower, upper)
-}
-
-func updateMagSafeLed(isChargingEnabled bool) {
-	err := smcConn.SetMagSafeCharging(isChargingEnabled)
-	if err != nil {
-		logrus.Errorf("SetMagSafeCharging failed: %v", err)
-	}
 }
 
 var lastPrintTime time.Time

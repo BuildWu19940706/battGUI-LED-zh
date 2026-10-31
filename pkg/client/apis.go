@@ -210,6 +210,7 @@ func (c *Client) GetPowerTelemetry() (*powerinfo.PowerTelemetry, error) {
 
 // TelemetryResponse represents unified telemetry returned from the daemon.
 type TelemetryResponse struct {
+	Control     *powerinfo.ControlStatus  `json:"control,omitempty"`
 	Power       *powerinfo.PowerTelemetry `json:"power,omitempty"`
 	Calibration *calibration.Status       `json:"calibration,omitempty"`
 }

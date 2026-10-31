@@ -1,6 +1,9 @@
 package smc
 
-import "github.com/sirupsen/logrus"
+import (
+	"fmt"
+	"github.com/sirupsen/logrus"
+)
 
 // MagSafeLedState is the state of the MagSafe LED.
 type MagSafeLedState uint8
@@ -35,14 +38,17 @@ func (c *AppleSMC) GetMagSafeLedState() (MagSafeLedState, error) {
 	logrus.Tracef("GetMagSafeLedState called")
 
 	v, err := c.Read(MagSafeLedKey)
-	if err != nil || len(v.Bytes) != 1 {
-		return LEDOrange, err
+	if err != nil {
+		return LEDSystem, err
+	}
+	if len(v.Bytes) != 1 {
+		return LEDSystem, fmt.Errorf("invalid MagSafe LED data length: %d", len(v.Bytes))
 	}
 
 	rawState := MagSafeLedState(v.Bytes[0])
 	ret := LEDOrange
 	switch rawState {
-	case LEDOff, LEDGreen, LEDOrange, LEDErrorOnce, LEDErrorPermSlow:
+	case LEDSystem, LEDOff, LEDGreen, LEDOrange, LEDErrorOnce, LEDErrorPermSlow, LEDErrorPermFast, LEDErrorPermOff:
 		ret = rawState
 	case 2:
 		ret = LEDGreen

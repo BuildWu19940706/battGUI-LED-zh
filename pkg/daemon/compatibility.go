@@ -27,10 +27,20 @@ func detectCapabilities() compatibility.Capabilities {
 	}
 	legacy := mode == compatibility.ChargeControlLegacy
 	active := legacy || mode == compatibility.ChargeControlAdapter
+	ledInterface := smcConn.CheckMagSafeExistence()
+	ledReason := ""
+	if !ledInterface {
+		ledReason = "no_interface"
+	} else if !active {
+		ledReason = "firmware_unverified"
+	}
 	return compatibility.Capabilities{
-		ChargingControl:   mode != compatibility.ChargeControlUnsupported,
-		ChargeControlMode: mode,
-		SupportedLimits:   supportedLimits,
+		ChargeRange:         mode != compatibility.ChargeControlUnsupported && mode != compatibility.ChargeControlNative,
+		MagSafeLEDInterface: ledInterface,
+		MagSafeLEDReason:    ledReason,
+		ChargingControl:     mode != compatibility.ChargeControlUnsupported,
+		ChargeControlMode:   mode,
+		SupportedLimits:     supportedLimits,
 		// The legacy and adapter loops both run while awake and rely on the
 		// sleep hooks to avoid overcharging during sleep.
 		SleepHooks: active,

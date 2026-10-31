@@ -284,6 +284,7 @@ func Run(configPath string, unixSocketPath string, allowNonRoot bool) error {
 		logrus.Errorf("failed to remove calibration sleep assertion before exiting: %v", err)
 	}
 
+	suspendControlStatus(true)
 	exitCaps := getCapabilities()
 	if exitCaps.ChargingControl {
 		if err := resetChargeControl(); err != nil {

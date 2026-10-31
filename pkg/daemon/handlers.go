@@ -751,6 +751,7 @@ func getUnifiedTelemetry(c *gin.Context) {
 	wantCal := c.Query("calibration") != "0"
 
 	resp := gin.H{}
+	resp["control"] = getControlStatus()
 
 	if wantPower {
 		info, err := powerkit.GetSystemInfo(powerkit.FetchOptions{QueryIOKit: true, QuerySMC: false})

@@ -28,10 +28,12 @@ func detectCapabilities() compatibility.Capabilities {
 	legacy := mode == compatibility.ChargeControlLegacy
 	active := legacy || mode == compatibility.ChargeControlAdapter
 	ledInterface := smcConn.CheckMagSafeExistence()
+	firmwareLED := mode == compatibility.ChargeControlFirmware && supportsFirmwareLED(currentFirmwareLEDProfile)
+	ledAvailable := ledInterface && (active || firmwareLED)
 	ledReason := ""
 	if !ledInterface {
 		ledReason = "no_interface"
-	} else if !active {
+	} else if !ledAvailable {
 		ledReason = "firmware_unverified"
 	}
 	return compatibility.Capabilities{
@@ -44,9 +46,9 @@ func detectCapabilities() compatibility.Capabilities {
 		// The legacy and adapter loops both run while awake and rely on the
 		// sleep hooks to avoid overcharging during sleep.
 		SleepHooks: active,
-		// LED state follows the switch batt toggles: the charge-enable keys in
-		// legacy mode, wall power in adapter mode. Either way batt knows it.
-		MagSafeLED: active && smcConn.CheckMagSafeExistence(),
+		// The LED writer is independent of the charge-control backend. Firmware
+		// mode additionally requires an explicitly tested platform profile.
+		MagSafeLED: ledAvailable,
 		// In adapter mode batt owns the adapter to enforce the limit, so the
 		// manual adapter/force-discharge feature is hidden to avoid conflicts.
 		AdapterControl: adapter && mode != compatibility.ChargeControlAdapter,

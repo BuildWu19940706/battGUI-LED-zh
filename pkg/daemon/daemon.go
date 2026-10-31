@@ -124,6 +124,13 @@ func Run(configPath string, unixSocketPath string, allowNonRoot bool) error {
 	if err := smcConn.Open(); err != nil {
 		return fmt.Errorf("open Apple SMC: %w", err)
 	}
+	if smcConn.ChargeControlMode() == compatibility.ChargeControlFirmware && smcConn.CheckMagSafeExistence() {
+		profile, profileErr := readFirmwareLEDProfile()
+		currentFirmwareLEDProfile = profile
+		if profileErr != nil {
+			logrus.WithError(profileErr).Warn("firmware LED profile unavailable; keeping LED control disabled")
+		}
+	}
 	caps := detectCapabilities()
 	setChargeControl(caps)
 	logrus.WithFields(capabilityLogFields(caps)).Info("detected hardware capabilities")

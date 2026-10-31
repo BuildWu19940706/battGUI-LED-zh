@@ -2,8 +2,16 @@ package gui
 
 import (
 	"fmt"
+	"github.com/charlie0129/batt/pkg/compatibility"
 	"github.com/charlie0129/batt/pkg/powerinfo"
 )
+
+func magSafeEnableTitle(mode compatibility.ChargeControlMode) string {
+	if mode == compatibility.ChargeControlFirmware {
+		return tr("Enable (Firmware Mode)")
+	}
+	return tr("Enable")
+}
 
 func controlStatusTitle(status *powerinfo.ControlStatus) string {
 	if status == nil {

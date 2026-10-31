@@ -179,5 +179,7 @@
   "ScheduleSkip": "跳过本次校准",
   "SchedulePostpone": "推迟校准",
   "ScheduleError": "校准计划出错",
-  "LED release failed; system control could not be confirmed": "指示灯恢复失败，尚未确认已交回系统"
+  "LED release failed; system control could not be confirmed": "指示灯恢复失败，尚未确认已交回系统",
+  "Enable (Firmware Mode)": "启用（固件模式）",
+  "This platform passed administrator LED write/readback and visible-color checks. Firmware charge limits remain unchanged. Long-term sleep and reconnect behavior still needs observation; failures return control to the system.": "当前配置已通过管理员灯色读写和实际变色测试，继续使用固件限充。睡眠、重新连接及长时间运行的表现仍需观察；出现异常时会交回系统控制。"
 }

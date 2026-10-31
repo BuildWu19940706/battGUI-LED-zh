@@ -346,6 +346,10 @@ func (c *menuController) setCompatibility(installed bool, capabilities compatibi
 
 	c.menu.setHidden(itemAdvanced, !installed)
 	c.menu.setHidden(itemMagSafe, !usable || !capabilities.MagSafeLED)
+	c.menu.setTitle(itemMagSafeEnabled, magSafeEnableTitle(capabilities.ChargeControlMode))
+	if capabilities.MagSafeLED && capabilities.ChargeControlMode == compatibility.ChargeControlFirmware {
+		c.menu.setTooltip(itemMagSafe, tr("This platform passed administrator LED write/readback and visible-color checks. Firmware charge limits remain unchanged. Long-term sleep and reconnect behavior still needs observation; failures return control to the system."))
+	}
 	c.menu.setHidden(itemPreventIdleSleep, !usable || !capabilities.SleepHooks)
 	c.menu.setHidden(itemDisableChargingPreSleep, !usable || !capabilities.SleepHooks)
 	c.menu.setHidden(itemPreventSystemSleep, !usable || !capabilities.SleepHooks)

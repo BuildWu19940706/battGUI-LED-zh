@@ -52,6 +52,8 @@ func (c *AppleSMC) GetMagSafeLedState() (MagSafeLedState, error) {
 		ret = rawState
 	case 2:
 		ret = LEDGreen
+	default:
+		return LEDSystem, fmt.Errorf("unknown MagSafe LED state: 0x%02x", v.Bytes[0])
 	}
 	logrus.Tracef("GetMagSafeLedState returned %v", ret)
 	return ret, nil

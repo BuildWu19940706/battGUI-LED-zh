@@ -6,7 +6,7 @@ import (
 )
 
 func TestMagSafeSystemAndMalformedRead(t *testing.T) {
-	for _, data := range [][]byte{{0}, {0, 1}} {
+	for _, data := range [][]byte{{0}, {0, 1}, {255}} {
 		v, err := gosmc.NewValue(MagSafeLedKey, gosmc.TypeUInt8, data)
 		if err != nil {
 			t.Fatal(err)
@@ -17,10 +17,10 @@ func TestMagSafeSystemAndMalformedRead(t *testing.T) {
 		}
 		defer c.Close()
 		got, err := c.GetMagSafeLedState()
-		if len(data) == 1 && (got != LEDSystem || err != nil) {
+		if len(data) == 1 && data[0] == 0 && (got != LEDSystem || err != nil) {
 			t.Fatalf("system state=%v error=%v", got, err)
 		}
-		if len(data) != 1 && err == nil {
+		if (len(data) != 1 || data[0] == 255) && err == nil {
 			t.Fatal("malformed LED read reported success")
 		}
 	}

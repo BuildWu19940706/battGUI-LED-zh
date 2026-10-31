@@ -41,6 +41,7 @@ app: build
 	mkdir -p bin/batt.app/Contents/MacOS
 	cp bin/batt bin/batt.app/Contents/MacOS/batt
 	cp pkg/gui/locales/zh-Hans.json bin/batt.app/Contents/Resources/zh-Hans.json
+	cp LICENSE README.zh-CN.md bin/batt.app/Contents/Resources/
 
 dmg: app
 	cd bin && create-dmg --volname batt --app-drop-link 360 130 --icon batt 130 130 --format ULMO "batt-$(VERSION).dmg" batt.app

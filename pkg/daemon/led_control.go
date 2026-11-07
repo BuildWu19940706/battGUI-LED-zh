@@ -10,7 +10,8 @@ import (
 )
 
 // One writer owns all daemon LED writes, including sleep and shutdown release.
-// A failed write/readback is terminal until the daemon is restarted.
+// A failed session only resumes after an explicit settings request successfully
+// establishes a system-controlled baseline, or after daemon restart.
 type ledController struct {
 	mu                   sync.Mutex
 	failed, owned, known bool
@@ -75,13 +76,37 @@ func (c *ledController) apply(state smc.MagSafeLedState, available bool, write f
 	c.last, c.known, c.owned = state, true, state != smc.LEDSystem
 }
 
-func (c *ledController) release(write func(smc.MagSafeLedState) error) {
+func (c *ledController) release(write func(smc.MagSafeLedState) error) error {
 	c.releaseAttempts++
 	if err := write(smc.LEDSystem); err != nil {
 		logrus.WithError(err).Error("could not restore system MagSafe control")
-		return
+		return err
 	}
 	c.owned, c.releasePending, c.known, c.last = false, false, true, smc.LEDSystem
+	return nil
+}
+
+// retry is called only for an explicit, validated user request. A failed
+// release keeps the session failed; it never authorizes a colored write.
+func (c *ledController) retry(write func(smc.MagSafeLedState) error) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.failed {
+		return nil
+	}
+	c.releaseAttempts = 0
+	c.owned, c.releasePending = true, true
+	if err := c.release(write); err != nil {
+		return fmt.Errorf("could not restore system MagSafe control before retry: %w", err)
+	}
+	c.failed, c.releaseAttempts = false, 0
+	return nil
+}
+
+func (c *ledController) failureState() (failed, releasePending bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.failed, c.releasePending
 }
 
 func (c *ledController) hasPendingRelease() bool {

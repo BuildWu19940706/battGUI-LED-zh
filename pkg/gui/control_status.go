@@ -13,6 +13,17 @@ func magSafeEnableTitle(mode compatibility.ChargeControlMode) string {
 	return tr("Enable")
 }
 
+func magSafeActionTitle(caps compatibility.Capabilities) string {
+	if caps.MagSafeLEDRetry {
+		return tr("Retry LED Control")
+	}
+	return magSafeEnableTitle(caps.ChargeControlMode)
+}
+
+func canShowMagSafeControls(installed bool, caps compatibility.Capabilities, needsUpgrade bool) bool {
+	return installed && caps.ChargingControl && !needsUpgrade && caps.Supports(compatibility.FeatureMagSafeLED)
+}
+
 func controlStatusTitle(status *powerinfo.ControlStatus) string {
 	if status == nil {
 		return tr("State: Unknown")

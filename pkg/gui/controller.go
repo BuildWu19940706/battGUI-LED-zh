@@ -345,9 +345,12 @@ func (c *menuController) setCompatibility(installed bool, capabilities compatibi
 	}
 
 	c.menu.setHidden(itemAdvanced, !installed)
-	c.menu.setHidden(itemMagSafe, !usable || !capabilities.MagSafeLED)
-	c.menu.setTitle(itemMagSafeEnabled, magSafeEnableTitle(capabilities.ChargeControlMode))
-	if capabilities.MagSafeLED && capabilities.ChargeControlMode == compatibility.ChargeControlFirmware {
+	c.menu.setHidden(itemMagSafe, !canShowMagSafeControls(installed, capabilities, needsUpgrade))
+	c.menu.setTitle(itemMagSafeEnabled, magSafeActionTitle(capabilities))
+	c.menu.setTooltip(itemMagSafe, "")
+	if capabilities.MagSafeLEDRetry {
+		c.menu.setTooltip(itemMagSafe, tr("Retry first restores system control, then starts a new LED session. If recovery fails, control stays disabled."))
+	} else if capabilities.MagSafeLED && capabilities.ChargeControlMode == compatibility.ChargeControlFirmware {
 		c.menu.setTooltip(itemMagSafe, tr("This platform passed administrator LED write/readback and visible-color checks. Firmware charge limits remain unchanged. Long-term sleep and reconnect behavior still needs observation; failures return control to the system."))
 	}
 	c.menu.setHidden(itemPreventIdleSleep, !usable || !capabilities.SleepHooks)
@@ -376,9 +379,8 @@ func (c *menuController) updateTelemetry() {
 		return
 	}
 	if telemetry.Control != nil {
-		if !telemetry.Control.LED.Available {
-			c.menu.setHidden(itemMagSafe, true)
-		}
+		// Compatibility controls access to settings, including manual recovery.
+		// A failed telemetry sample must not hide the recovery action again.
 		c.menu.setTitle(itemState, controlStatusTitle(telemetry.Control))
 		c.menu.setTitle(itemLEDStatus, ledStatusTitle(telemetry.Control.LED))
 		c.menu.setControlState(telemetry.Control.State, controlStatusTitle(telemetry.Control))
@@ -539,7 +541,8 @@ func (c *menuController) calibrationStatusTitle(status *calibration.Status) (str
 }
 
 func (c *menuController) updateMagSafeChecks(mode config.ControlMagSafeMode) {
-	c.menu.setChecked(itemMagSafeEnabled, mode == config.ControlMagSafeModeEnabled)
-	c.menu.setChecked(itemMagSafeAlwaysOff, mode == config.ControlMagSafeModeAlwaysOff)
-	c.menu.setChecked(itemMagSafeDisabled, mode != config.ControlMagSafeModeEnabled && mode != config.ControlMagSafeModeAlwaysOff)
+	active := !c.capabilities.MagSafeLEDRetry
+	c.menu.setChecked(itemMagSafeEnabled, active && mode == config.ControlMagSafeModeEnabled)
+	c.menu.setChecked(itemMagSafeAlwaysOff, active && mode == config.ControlMagSafeModeAlwaysOff)
+	c.menu.setChecked(itemMagSafeDisabled, active && mode != config.ControlMagSafeModeEnabled && mode != config.ControlMagSafeModeAlwaysOff)
 }

@@ -229,10 +229,11 @@ func requireCapability(c *gin.Context, feature compatibility.Feature) bool {
 
 func getCompatibility(c *gin.Context) {
 	caps := getCapabilities()
-	if statusLED.hasFailed() {
+	if failed, pending := statusLED.failureState(); failed {
+		caps.MagSafeLEDRetry = caps.MagSafeLED
 		caps.MagSafeLED = false
 		caps.MagSafeLEDReason = "write_failed"
-		if statusLED.hasPendingRelease() {
+		if pending {
 			caps.MagSafeLEDReason = "release_failed"
 		}
 	}

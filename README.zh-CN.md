@@ -1,6 +1,6 @@
 # batt 中文核心增强版
 
-版本：`v0.8.0-zh.3`。基于 [charlie0129/batt](https://github.com/charlie0129/batt) 的 `2b9f8b579670b3d07365772f6f8e56b4f53912be`，沿用 GPL-2.0 许可证。
+版本：`v0.8.0-zh.4`。基于 [charlie0129/batt](https://github.com/charlie0129/batt) 的 `2b9f8b579670b3d07365772f6f8e56b4f53912be`，沿用 GPL-2.0 许可证。
 
 ## 使用
 
@@ -28,6 +28,8 @@
 
 `v0.8.0-zh.3` 修复写入后过早校验造成的误停用：实测最初 0–11 毫秒仍返回旧灯色，约 50 毫秒时读回才匹配。后台现在只重复读取，分段等待总计最多 500 毫秒，匹配即结束；持续不匹配仍恢复系统，并在日志中记录期望值与实际读回值。真实写入或读取错误仍立即触发回退，不重复写入颜色。升级并重启后台会清除旧版会话的失败状态，已有启用偏好会保留。
 
+`v0.8.0-zh.4` 支持失败后手动重新接管，无需重启后台：**高级设置 → MagSafe 指示灯 → 重新接管灯控**。失败时保留菜单，并清除表示正在接管的勾选。每次手动重试先写入系统控制；成功后解除失败锁定，在下一次状态采样时重新判断灯色，通常约10秒。恢复系统仍失败时保留失败状态、提示错误并回滚这次灯控设置。选择“禁用”或“常灭”也支持同样的恢复检查。菜单操作后立即刷新状态。
+
 此处确认的是基础管理员读写和实际变色，睡眠、拔插及长时间运行的物理稳定性仍需继续观察。写入或读回失败后会停止彩色控制，并尝试恢复系统；未能确认恢复时会明确提示。
 
 机型、系统或固件与已测组合不符时，保留“尚未验证”状态和菜单栏回退。系统或固件升级后需要重新验证。配置识别只在后台启动时读取一次，不保留设备序列号或 UUID。
@@ -54,7 +56,7 @@ go mod download
 go test ./...
 go test -race ./pkg/daemon ./pkg/client ./pkg/config ./pkg/compatibility ./pkg/powerinfo
 go vet ./...
-make app VERSION=v0.8.0-zh.3
+make app VERSION=v0.8.0-zh.4
 codesign --force --deep --sign - bin/batt.app
 ```
 
@@ -71,8 +73,8 @@ go run ./hack/ledprobe
 ## 接口
 
 - 新增 `PUT /charge-range`，JSON 为 `{"upper":80,"lower":75}`；成功返回 201。后台拒绝无效范围、不支持的后端或校准冲突。保存与应用失败返回 500 并尝试恢复原设置。
-- `/compatibility` 新增可选的 `chargeRange`、`magSafeLEDInterface` 和 `magSafeLEDReason`。`magSafeLED` 继续表示当前可用的自动灯控；接口存在与自动控制可用是两个概念。
+- `/compatibility` 新增可选的 `chargeRange`、`magSafeLEDInterface` 和 `magSafeLEDReason` 和 `magSafeLEDRetry`。后者仅在已验证硬件的失败会话中为true，表示可手动恢复；它不表示当前灯控正在工作。`magSafeLED` 继续表示当前可用的自动灯控；接口存在与自动控制可用是两个概念。
 - `/telemetry` 新增可选 `control`，包含目标、上下限、当前电量、状态原因、采样时间及灯控状态。`unknown` 或过期的采样不能作为达标依据。
 - 旧 CLI、配置字段及接口继续保留。旧后台缺少新增能力时，GUI 会禁用范围编辑并提示升级。
 
-本次修复见 [读回时序检查记录](docs/validation/2026-11-01-led-readback-timing.md)；固件能力验证见 [固件灯控检查记录](docs/validation/2026-11-01-firmware-led.md)；前版记录保存在 [首次交付检查](docs/validation/2026-11-01-zh-core.md)。
+本次修复见 [手动接管检查记录](docs/validation/2026-11-07-led-manual-retry.md)；此前修复见 [读回时序检查记录](docs/validation/2026-11-01-led-readback-timing.md)；固件能力验证见 [固件灯控检查记录](docs/validation/2026-11-01-firmware-led.md)；前版记录保存在 [首次交付检查](docs/validation/2026-11-01-zh-core.md)。

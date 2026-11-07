@@ -135,6 +135,8 @@ func (c *menuController) setMagSafeMode(mode config.ControlMagSafeMode) {
 		logrus.WithError(err).Error("Failed to set control mag safe LED")
 		showAlert(tr("Failed to set MagSafe LED control"), err.Error())
 	}
+	c.refreshOnOpen()
+	c.updateTelemetry()
 }
 
 func (c *menuController) setPreventIdleSleep(checked bool) {

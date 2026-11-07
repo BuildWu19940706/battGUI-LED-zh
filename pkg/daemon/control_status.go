@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/charlie0129/batt/pkg/calibration"
+	"github.com/charlie0129/batt/pkg/compatibility"
 	"github.com/charlie0129/batt/pkg/config"
 	"github.com/charlie0129/batt/pkg/powerinfo"
 	"github.com/charlie0129/batt/pkg/smc"
@@ -84,15 +85,27 @@ func refreshControlStatus() {
 		}
 	}
 	statusLED.apply(desired, caps.MagSafeLED, smcConn.SetMagSafeLedState, smcConn.GetMagSafeLedState)
-	if statusLED.hasFailed() {
-		snapshot.LED.Available = false
-		snapshot.LED.Reason = "write_failed"
-		if statusLED.hasPendingRelease() {
-			snapshot.LED.Reason = "release_failed"
-		}
-		snapshot.LED.Desired = "system"
-	}
+	snapshot.LED = currentLEDStatus(caps, conf.ControlMagSafeLED(), snapshot.LED.Desired)
 	controlState.snapshot = snapshot
+}
+
+func currentLEDStatus(caps compatibility.Capabilities, mode config.ControlMagSafeMode, desired string) powerinfo.LEDStatus {
+	status := powerinfo.LEDStatus{InterfacePresent: caps.MagSafeLEDInterface, Available: caps.MagSafeLED, Reason: caps.MagSafeLEDReason, Mode: string(mode), Desired: desired}
+	if failed, pending := statusLED.failureState(); failed {
+		status.Available, status.Desired, status.Reason = false, "system", "write_failed"
+		if pending {
+			status.Reason = "release_failed"
+		}
+	}
+	return status
+}
+
+// Refresh LED telemetry after a manual baseline attempt without resetting the
+// independent evidence that the charge target has been reached.
+func recordLEDRecovery() {
+	controlState.Lock()
+	defer controlState.Unlock()
+	controlState.snapshot.LED = currentLEDStatus(getCapabilities(), conf.ControlMagSafeLED(), "system")
 }
 
 func getControlStatus() powerinfo.ControlStatus {

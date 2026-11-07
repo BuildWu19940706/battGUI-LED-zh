@@ -613,6 +613,8 @@ func setLowerLimitDelta(c *gin.Context) {
 }
 
 func setControlMagSafeLED(c *gin.Context) {
+	chargeControlTransitionMu.Lock()
+	defer chargeControlTransitionMu.Unlock()
 	if !requireCapability(c, compatibility.FeatureMagSafeLED) {
 		return
 	}
@@ -625,19 +627,49 @@ func setControlMagSafeLED(c *gin.Context) {
 		return
 	}
 
-	var mode config.ControlMagSafeMode
-	if err := c.BindJSON(&mode); err != nil {
+	var payload any
+	if err := c.ShouldBindJSON(&payload); err != nil {
 		c.IndentedJSON(http.StatusBadRequest, err.Error())
 		_ = c.AbortWithError(http.StatusBadRequest, err)
 		return
 	}
+	var mode config.ControlMagSafeMode
+	switch value := payload.(type) {
+	case string:
+		mode = config.ControlMagSafeMode(value)
+	case bool: // Preserve the old CLI's boolean request format.
+		mode = config.ControlMagSafeModeDisabled
+		if value {
+			mode = config.ControlMagSafeModeEnabled
+		}
+	}
+	if mode != config.ControlMagSafeModeEnabled && mode != config.ControlMagSafeModeDisabled && mode != config.ControlMagSafeModeAlwaysOff {
+		c.IndentedJSON(http.StatusBadRequest, "expected enabled, disabled, always-off or a boolean")
+		return
+	}
 
+	previous := conf.ControlMagSafeLED()
 	conf.SetControlMagSafeLED(mode)
 	if err := conf.Save(); err != nil {
+		conf.SetControlMagSafeLED(previous)
 		logrus.Errorf("saveConfig failed: %v", err)
 		c.IndentedJSON(http.StatusInternalServerError, err.Error())
 		_ = c.AbortWithError(http.StatusInternalServerError, err)
 		return
+	}
+	if statusLED.hasFailed() {
+		if err := statusLED.retry(smcConn.SetMagSafeLedState); err != nil {
+			conf.SetControlMagSafeLED(previous)
+			if rollbackErr := conf.Save(); rollbackErr != nil {
+				err = errors.Join(err, fmt.Errorf("restore previous LED setting: %w", rollbackErr))
+			}
+			recordLEDRecovery()
+			logrus.WithError(err).Warn("manual MagSafe recovery failed")
+			c.IndentedJSON(http.StatusInternalServerError, err.Error())
+			return
+		}
+		recordLEDRecovery()
+		logrus.Info("manual MagSafe recovery established system baseline; resuming on next sample")
 	}
 
 	logrus.Infof("set control MagSafe LED to %s", mode)

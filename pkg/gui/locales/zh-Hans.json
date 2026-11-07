@@ -181,5 +181,7 @@
   "ScheduleError": "校准计划出错",
   "LED release failed; system control could not be confirmed": "指示灯恢复失败，尚未确认已交回系统",
   "Enable (Firmware Mode)": "启用（固件模式）",
+  "Retry LED Control": "重新接管灯控",
+  "Retry first restores system control, then starts a new LED session. If recovery fails, control stays disabled.": "重试会先恢复系统控制，再开始新的灯控会话。恢复失败时继续停用自定义灯色。",
   "This platform passed administrator LED write/readback and visible-color checks. Firmware charge limits remain unchanged. Long-term sleep and reconnect behavior still needs observation; failures return control to the system.": "当前配置已通过管理员灯色读写和实际变色测试，继续使用固件限充。睡眠、重新连接及长时间运行的表现仍需观察；出现异常时会交回系统控制。"
 }

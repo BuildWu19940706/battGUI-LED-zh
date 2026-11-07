@@ -44,9 +44,12 @@ type Capabilities struct {
 	ChargeControlMode ChargeControlMode `json:"chargeControlMode"`
 	// SupportedLimits lists the only upper limits the charge-control backend
 	// accepts, in ascending order. Empty means any limit from 10 to 100.
-	SupportedLimits     []int  `json:"supportedLimits,omitempty"`
-	SleepHooks          bool   `json:"sleepHooks"`
-	MagSafeLED          bool   `json:"magSafeLED"`
+	SupportedLimits []int `json:"supportedLimits,omitempty"`
+	SleepHooks      bool  `json:"sleepHooks"`
+	MagSafeLED      bool  `json:"magSafeLED"`
+	// MagSafeLEDRetry advertises an explicit recovery operation on verified
+	// hardware; MagSafeLED itself stays false while the session has failed.
+	MagSafeLEDRetry     bool   `json:"magSafeLEDRetry,omitempty"`
 	MagSafeLEDInterface bool   `json:"magSafeLEDInterface,omitempty"`
 	MagSafeLEDReason    string `json:"magSafeLEDReason,omitempty"`
 	ChargeRange         bool   `json:"chargeRange,omitempty"`
@@ -81,7 +84,7 @@ func (c Capabilities) Supports(feature Feature) bool {
 	case FeatureSleepHooks:
 		return c.SleepHooks
 	case FeatureMagSafeLED:
-		return c.MagSafeLED
+		return c.MagSafeLED || c.MagSafeLEDRetry
 	case FeatureAdapterControl:
 		return c.AdapterControl
 	case FeatureAdapterSleepPolicy:

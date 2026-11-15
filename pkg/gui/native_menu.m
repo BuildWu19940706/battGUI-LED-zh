@@ -146,8 +146,25 @@ static NSMenu *AddSubmenu(BattMenuController *controller,
         symbol = @"fluid.batteryblock";
         description = BattLocalized(@"batt needs upgrade");
     }
-    self.statusItem.button.image = [NSImage imageWithSystemSymbolName:symbol
-                                            accessibilityDescription:description];
+    NSImage *symbolImage = [NSImage imageWithSystemSymbolName:symbol
+                                   accessibilityDescription:description];
+    // Bake white into a non-template image: status-bar template rendering can
+    // override the button's contentTintColor. Keep vector drawing for Retina.
+    NSImage *image = [NSImage imageWithSize:symbolImage.size flipped:NO
+        drawingHandler:^BOOL(NSRect rect) {
+            CGContextRef context = NSGraphicsContext.currentContext.CGContext;
+            CGContextSaveGState(context);
+            CGContextBeginTransparencyLayer(context, NULL);
+            [symbolImage drawInRect:rect];
+            [NSColor.whiteColor setFill];
+            NSRectFillUsingOperation(rect, NSCompositingOperationSourceIn);
+            CGContextEndTransparencyLayer(context);
+            CGContextRestoreGState(context);
+            return YES;
+        }];
+    image.template = NO;
+    self.statusItem.button.image = image;
+    self.statusItem.button.accessibilityLabel = description;
 }
 
 - (void)setPowerItem:(BattMenuItem)item label:(NSString *)label value:(double)value {

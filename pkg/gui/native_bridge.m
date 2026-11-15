@@ -76,11 +76,9 @@ void batt_menu_set_power(BattMenuRef menu, int item, const char *label, double v
 }
 
 void batt_menu_set_control_state(BattMenuRef menu, const char *state, const char *description) {
+    (void)state;
     @autoreleasepool {
         NSButton *button = BattController(menu).statusItem.button;
-        NSString *value = BattString(state);
-        button.contentTintColor = ([value isEqualToString:@"reached"] || [value isEqualToString:@"holding"])
-            ? NSColor.systemGreenColor : ([value isEqualToString:@"charging"] ? NSColor.systemOrangeColor : nil);
         button.toolTip = BattString(description);
     }
 }

@@ -148,8 +148,8 @@ static NSMenu *AddSubmenu(BattMenuController *controller,
     }
     NSImage *symbolImage = [NSImage imageWithSystemSymbolName:symbol
                                    accessibilityDescription:description];
-    // Bake white into a non-template image: status-bar template rendering can
-    // override the button's contentTintColor. Keep vector drawing for Retina.
+    // 菜单栏会为模板图像重新着色。用符号的透明度遮罩绘制白色图像，
+    // 并保留矢量绘制，以便 Retina 屏幕按实际分辨率渲染。
     NSImage *image = [NSImage imageWithSize:symbolImage.size flipped:NO
         drawingHandler:^BOOL(NSRect rect) {
             CGContextRef context = NSGraphicsContext.currentContext.CGContext;

@@ -76,6 +76,7 @@ void batt_menu_set_power(BattMenuRef menu, int item, const char *label, double v
 }
 
 void batt_menu_set_control_state(BattMenuRef menu, const char *state, const char *description) {
+    // 图标固定为白色，充电状态通过悬停提示中的本地化文字显示。
     (void)state;
     @autoreleasepool {
         NSButton *button = BattController(menu).statusItem.button;

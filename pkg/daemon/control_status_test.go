@@ -2,7 +2,9 @@ package daemon
 
 import (
 	"github.com/charlie0129/batt/pkg/calibration"
+	"github.com/charlie0129/batt/pkg/config"
 	"github.com/charlie0129/batt/pkg/powerinfo"
+	"github.com/charlie0129/batt/pkg/smc"
 	"testing"
 	"time"
 )
@@ -58,5 +60,31 @@ func TestPowerConnectionEventInvalidatesBetweenSamples(t *testing.T) {
 	controlState.Unlock()
 	if got.State != "paused" {
 		t.Fatalf("reconnect kept previous reached latch: %+v", got)
+	}
+}
+
+func TestMagSafeColorAcrossReconnectAndChargeLimit(t *testing.T) {
+	var tracker powerinfo.ControlTracker
+	for _, sample := range []struct {
+		name              string
+		charge, target    int
+		plugged, charging bool
+		want              smc.MagSafeLedState
+		label             string
+	}{
+		{"at limit", 80, 80, true, false, smc.LEDGreen, "green"},
+		{"unplugged", 79, 80, false, false, smc.LEDSystem, "system"},
+		{"reconnected without charging", 79, 80, true, false, smc.LEDGreen, "green"},
+		{"charging below limit", 79, 80, true, true, smc.LEDOrange, "orange"},
+		{"charging flag still set at limit", 80, 80, true, true, smc.LEDGreen, "green"},
+		{"charging flag still set above limit", 81, 80, true, true, smc.LEDGreen, "green"},
+		{"charging once toward full", 81, 100, true, true, smc.LEDOrange, "orange"},
+	} {
+		in := powerinfo.ControlInput{Valid: true, Now: time.Now(), Charge: sample.charge, Target: sample.target, ConfiguredUpper: 80, Lower: 75, PluggedIn: sample.plugged, Charging: sample.charging}
+		state := tracker.Update(in)
+		got, label := desiredMagSafeLED(in, state.State, config.ControlMagSafeModeEnabled, true)
+		if got != sample.want || label != sample.label {
+			t.Errorf("%s: got %v (%s), want %v (%s)", sample.name, got, label, sample.want, sample.label)
+		}
 	}
 }

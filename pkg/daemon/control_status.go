@@ -66,27 +66,32 @@ func refreshControlStatus() {
 	defer controlState.Unlock()
 	in.Suspended = controlState.suspended
 	snapshot := controlState.tracker.Update(in)
-	snapshot.LED = powerinfo.LEDStatus{InterfacePresent: caps.MagSafeLEDInterface, Available: caps.MagSafeLED, Reason: caps.MagSafeLEDReason, Mode: string(conf.ControlMagSafeLED()), Desired: "system"}
-	desired := smc.LEDSystem
-	if in.Valid && in.PluggedIn && !in.Suspended && caps.MagSafeLED {
-		switch conf.ControlMagSafeLED() {
-		case config.ControlMagSafeModeAlwaysOff:
-			desired = smc.LEDOff
-			snapshot.LED.Desired = "off"
-		case config.ControlMagSafeModeEnabled:
-			switch snapshot.State {
-			case "charging", "discharging", "calibrating":
-				desired = smc.LEDOrange
-				snapshot.LED.Desired = "orange"
-			case "reached", "holding":
-				desired = smc.LEDGreen
-				snapshot.LED.Desired = "green"
-			}
-		}
-	}
+	mode := conf.ControlMagSafeLED()
+	desired, name := desiredMagSafeLED(in, snapshot.State, mode, caps.MagSafeLED)
 	statusLED.apply(desired, caps.MagSafeLED, smcConn.SetMagSafeLedState, smcConn.GetMagSafeLedState)
-	snapshot.LED = currentLEDStatus(caps, conf.ControlMagSafeLED(), snapshot.LED.Desired)
+	snapshot.LED = currentLEDStatus(caps, mode, name)
 	controlState.snapshot = snapshot
+}
+
+func desiredMagSafeLED(in powerinfo.ControlInput, state string, mode config.ControlMagSafeMode, available bool) (smc.MagSafeLedState, string) {
+	if !available || !in.Valid || !in.PluggedIn || in.Suspended {
+		return smc.LEDSystem, "system"
+	}
+	switch mode {
+	case config.ControlMagSafeModeAlwaysOff:
+		return smc.LEDOff, "off"
+	case config.ControlMagSafeModeEnabled:
+		if state == "unknown" {
+			return smc.LEDSystem, "system"
+		}
+		// 每次采样按当前充电标志和有效目标选色，重新插电无需等待新的达标记录。
+		if in.Charging && in.Charge < in.Target {
+			return smc.LEDOrange, "orange"
+		}
+		return smc.LEDGreen, "green"
+	default:
+		return smc.LEDSystem, "system"
+	}
 }
 
 func currentLEDStatus(caps compatibility.Capabilities, mode config.ControlMagSafeMode, desired string) powerinfo.LEDStatus {

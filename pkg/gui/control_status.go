@@ -64,7 +64,7 @@ func ledStatusTitle(status powerinfo.LEDStatus) string {
 	case status.Available:
 		switch status.Mode {
 		case "enabled":
-			message = "Indicate charge target"
+			message = "Indicate charging status"
 		case "always-off":
 			message = "Always off"
 		}

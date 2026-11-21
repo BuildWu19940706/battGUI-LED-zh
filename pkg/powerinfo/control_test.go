@@ -68,6 +68,7 @@ func TestControlSpecialModes(t *testing.T) {
 		{"100 percent is not proof of full", ControlInput{Target: 100, Charge: 100}, "paused"},
 		{"confirmed full", ControlInput{Target: 100, Charge: 100, Full: true}, "reached"},
 		{"discharge above target", ControlInput{Target: 80, Charge: 90, ForcedDischarge: true}, "discharging"},
+		{"firmware above target with battery draw", ControlInput{Target: 80, Charge: 90, Discharging: true}, "reached"},
 		{"calibration above target", ControlInput{Target: 80, Charge: 90, Calibrating: true}, "calibrating"},
 		{"invalid percentage", ControlInput{Target: 80, Charge: 101}, "unknown"},
 	}
@@ -84,5 +85,23 @@ func TestControlSpecialModes(t *testing.T) {
 				t.Fatalf("got %+v want %s", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestControlNativeDischargeAboveTarget(t *testing.T) {
+	tracker := ControlTracker{}
+	in := ControlInput{Valid: true, PluggedIn: true, NativeLimit: true, Target: 80, Charge: 86, Now: time.Unix(100, 0)}
+	if got := tracker.Update(in); got.State != "reached" {
+		t.Fatalf("initial sample: %+v", got)
+	}
+	in.Charge = 85
+	in.Discharging = true
+	if got := tracker.Update(in); got.State != "discharging" || got.Reason != "battery_supplementing" {
+		t.Fatalf("draining above the native limit: %+v", got)
+	}
+	in.Charge = 79
+	in.Discharging = false
+	if got := tracker.Update(in); got.State != "paused" {
+		t.Fatalf("drain should clear the previously reached target: %+v", got)
 	}
 }

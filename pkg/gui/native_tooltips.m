@@ -21,9 +21,9 @@ void BattApplyTooltips(BattMenuController *controller) {
          "Note that you must have a MagSafe LED on your MacBook to use this feature."));
     SetTooltip(controller, BattItemMagSafeEnabled,
         BattLocalized(@"Enable MagSafe LED control. The LED will reflect charging status:\n\n"
-         "- Green: The battery is not charging, or its level is at or above the current target.\n"
-         "- Orange: The battery is charging below the current target.\n"
-         "- System: Asleep, unplugged or data unavailable."));
+         "- Green: Charging is stopped.\n"
+         "- Orange: Charging is in progress.\n"
+         "- Off: Forced off, or temporarily after wake with active charging control."));
     SetTooltip(controller, BattItemMagSafeDisabled,
         BattLocalized(@"Disable MagSafe LED control. The LED will stay in its default state (mostly orange)."));
     SetTooltip(controller, BattItemMagSafeAlwaysOff,
@@ -49,6 +49,9 @@ void BattApplyTooltips(BattMenuController *controller) {
         BattLocalized(@"Set whether to keep Clamshell mode alive while adapter input is disabled by temporarily disabling system sleep.\n\n"
          "This prevents all sleep—not just idle sleep—while adapter input is disabled, allowing Force Discharge and Auto Calibration to continue with the lid closed. When adapter input returns, batt automatically restores the prior sleep setting.\n\n"
          "WARNING: Your Mac may remain awake with the lid closed, overheat in a bag, or drain its battery to 0% if unplugged and left unattended."));
+    SetTooltip(controller, BattItemNoDrain,
+        BattLocalized(@"Experimental macOS 27 native-mode option. Hold wall power above the limit instead of draining the battery.\n\n"
+         "Changing this policy restarts powerd. batt waits for other applications' sleep assertions to end first and uses the regular native limit meanwhile."));
     SetTooltip(controller, BattItemForceDischarge,
         BattLocalized(@"Cut power from the wall and run from the battery, either indefinitely or for a selected duration. After a temporary force discharge, batt automatically restores the power adapter.\n\n"
          "NOTE: if you are using Clamshell mode (using a Mac laptop with an external monitor and the lid closed), *cutting power will cause your Mac to go to sleep* unless \"Prevent Sleep when Adapter is Disabled\" is enabled. This is a limitation of macOS. There are ways to prevent this, but it is not recommended for most users."));

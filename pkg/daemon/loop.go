@@ -1,25 +1,19 @@
 package daemon
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
 	"reflect"
-	"sync"
 	"time"
-
-	"github.com/sirupsen/logrus"
 
 	"github.com/charlie0129/batt/pkg/calibration"
 	"github.com/charlie0129/batt/pkg/compatibility"
 	"github.com/charlie0129/batt/pkg/config"
-)
-
-var (
-	maintainedChargingInProgress = false
-	maintainLoopInnerLock        = &sync.Mutex{}
-	// wg is used to skip several loops when system woke up or before sleep
-	wg                      = &sync.WaitGroup{}
-	loopInterval            = time.Duration(10) * time.Second
-	loopRecorder            = NewTimeSeriesRecorder(60)
-	continuousLoopThreshold = 1*time.Minute + 20*time.Second // add 20s to be sure
+	"github.com/charlie0129/batt/pkg/logging"
+	"github.com/charlie0129/batt/pkg/powerui"
+	"github.com/charlie0129/batt/pkg/smc"
 )
 
 // adapterMinBand is the minimum hysteresis band (upper - lower) enforced in
@@ -29,86 +23,97 @@ var (
 // lower); it never raises the ceiling, so the limit is always respected.
 const adapterMinBand = 5
 
-// infiniteLoop runs forever and maintains the battery charge,
-// which is called by the daemon.
-func infiniteLoop() {
+// runLoop maintains the battery charge until ctx is cancelled.
+func (d *Daemon) runLoop(ctx context.Context) {
 	for {
-		now := time.Now()
-		if restoreDisabledLimit(conf, now) {
-			maintainLoopForced()
+		d.loopOnce(time.Now())
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(d.loopInterval):
 		}
-		if completeChargeOnce(conf) {
-			maintainLoopForced()
-		}
-		if adapterSleepPolicyCapable() {
-			maintainAdapterDisable(conf, now)
-		}
-		maintainLoop()
-		refreshControlStatus()
-		time.Sleep(loopInterval)
 	}
+}
+
+// loopOnce is one iteration of the main loop: it finishes elapsed timers and
+// one-time charges, keeps a temporary adapter disable enforced, then runs a
+// maintenance pass.
+func (d *Daemon) loopOnce(now time.Time) {
+	if d.restoreDisabledLimit(now) {
+		d.maintainLoopForced()
+	}
+	if d.completeChargeOnce() {
+		d.maintainLoopForced()
+	}
+	if d.adapterSleepPolicyCapable() {
+		d.maintainAdapterDisable(now)
+	}
+	applied := d.maintainLoop()
+	d.refreshControlStatus(applied)
 }
 
 // maintainAdapterDisable keeps a temporary adapter disable active across
 // daemon restarts and enables the adapter once its deadline has passed. It
 // reports whether an expired schedule was completed.
-func maintainAdapterDisable(conf config.Config, now time.Time) bool {
-	chargeControlTransitionMu.Lock()
-	defer chargeControlTransitionMu.Unlock()
+func (d *Daemon) maintainAdapterDisable(now time.Time) bool {
+	d.transitionMu.Lock()
+	defer d.transitionMu.Unlock()
 
-	if err := reconcileAdapterSleepPolicy(); err != nil {
-		logrus.WithError(err).Error("failed to reconcile adapter sleep policy")
+	if err := d.reconcileAdapterSleepPolicy(); err != nil {
+		slog.Error("failed to reconcile adapter sleep policy", "error", err)
 	}
 
+	conf := d.conf
 	until := conf.AdapterDisableUntil()
 	if until.IsZero() {
 		return false
 	}
 	// Calibration owns the adapter throughout its workflow and restores its
 	// snapshot on completion or cancellation. Keep the timer pending until then.
-	if calibrationOwnsChargeLimit() {
+	if d.calibrationOwnsChargeLimit() {
 		return false
 	}
 
-	enabled, err := smcIsAdapterEnabled()
+	enabled, err := d.smc.IsAdapterEnabled()
 	if err != nil {
-		logrus.WithError(err).Error("failed to check power adapter for temporary disable")
+		slog.Error("failed to check power adapter for temporary disable", "error", err)
 		return false
 	}
 
 	if now.Before(until) {
-		if err := smcDisableAdapter(); err != nil {
-			logrus.WithError(err).Error("failed to maintain temporary power adapter disable")
+		if err := d.disableAdapter(); err != nil {
+			slog.Error("failed to maintain temporary power adapter disable", "error", err)
 		}
 		return false
 	}
 
 	if !enabled {
-		if err := smcEnableAdapter(); err != nil {
-			logrus.WithError(err).Error("failed to enable power adapter after temporary disable")
+		if err := d.enableAdapter(); err != nil {
+			slog.Error("failed to enable power adapter after temporary disable", "error", err)
 			return false
 		}
 	} else {
-		if err := releaseSleep(sleepHoldAdapter); err != nil {
-			logrus.WithError(err).Error("failed to release sleep hold after temporary disable")
+		if err := d.holds.release(sleepHoldAdapter); err != nil {
+			slog.Error("failed to release sleep hold after temporary disable", "error", err)
 			return false
 		}
 	}
 	conf.ClearAdapterDisableTimer()
 	if err := conf.Save(); err != nil {
-		logrus.Errorf("saveConfig failed: %v", err)
+		slog.Error("saveConfig failed", "error", err)
 		return false
 	}
-	logrus.Info("adapter disable duration elapsed, power adapter enabled")
+	slog.Info("adapter disable duration elapsed, power adapter enabled")
 	return true
 }
 
 // restoreDisabledLimit restores the upper limit saved by a "batt disable --for"
 // once its deadline has passed. It reports whether the limit was restored.
-func restoreDisabledLimit(conf config.Config, now time.Time) bool {
-	chargeControlTransitionMu.Lock()
-	defer chargeControlTransitionMu.Unlock()
+func (d *Daemon) restoreDisabledLimit(now time.Time) bool {
+	d.transitionMu.Lock()
+	defer d.transitionMu.Unlock()
 
+	conf := d.conf
 	until := conf.DisableUntil()
 	if until.IsZero() || now.Before(until) {
 		return false
@@ -118,7 +123,7 @@ func restoreDisabledLimit(conf config.Config, now time.Time) bool {
 	// which would silently undo the restore. This also resolves persisted
 	// conflicts after a daemon restart: calibration keeps ownership and the
 	// timer remains pending until calibration finishes or is cancelled.
-	if calibrationOwnsChargeLimit() {
+	if d.calibrationOwnsChargeLimit() {
 		return false
 	}
 
@@ -126,26 +131,26 @@ func restoreDisabledLimit(conf config.Config, now time.Time) bool {
 	conf.ClearDisableTimer()
 
 	if limit < 10 || limit > 100 {
-		logrus.Warnf("invalid saved charge limit %d%%, not restoring", limit)
+		slog.Warn(fmt.Sprintf("invalid saved charge limit %d%%, not restoring", limit))
 		if err := conf.Save(); err != nil {
-			logrus.Errorf("saveConfig failed: %v", err)
+			slog.Error("saveConfig failed", "error", err)
 		}
 		return false
 	}
-	caps := getCapabilities()
+	caps := d.getCapabilities()
 	if !caps.SupportsLimit(limit) {
 		snapped := caps.NearestSupportedLimit(limit)
-		logrus.WithFields(logrus.Fields{"saved": limit, "limit": snapped}).Warn("saved charge limit is not offered by this Mac, restoring the next supported limit")
+		slog.Warn("saved charge limit is not offered by this Mac, restoring the next supported limit", "saved", limit, "limit", snapped)
 		limit = snapped
 	}
 
 	conf.SetUpperLimit(limit)
 	if err := conf.Save(); err != nil {
-		logrus.Errorf("saveConfig failed: %v", err)
+		slog.Error("saveConfig failed", "error", err)
 	}
 
-	invalidateControlStatus()
-	logrus.WithField("limit", limit).Infof("disable duration elapsed, charge limit restored")
+	d.invalidateControlStatus()
+	slog.Info("disable duration elapsed, charge limit restored", "limit", limit)
 
 	return true
 }
@@ -154,20 +159,20 @@ func restoreDisabledLimit(conf config.Config, now time.Time) bool {
 // which could indicate that the system was in sleep mode or there is some issue
 // with the maintain loop execution.
 // It returns true if there are too many missed loops.
-func checkMissedMaintainLoops(logStatus bool) bool {
-	maintainLoopCount := loopRecorder.GetRecordsIn(continuousLoopThreshold)
-	expectedMaintainLoopCount := int(continuousLoopThreshold / loopInterval)
+func (d *Daemon) checkMissedMaintainLoops(logStatus bool) bool {
+	maintainLoopCount := d.loopRecorder.GetRecordsIn(d.continuousLoopThreshold)
+	expectedMaintainLoopCount := int(d.continuousLoopThreshold / d.loopInterval)
 	minMaintainLoopCount := expectedMaintainLoopCount - 1
-	relativeTimes := loopRecorder.GetLastRecords(continuousLoopThreshold)
+	relativeTimes := d.loopRecorder.GetLastRecords(d.continuousLoopThreshold)
 
 	if maintainLoopCount < minMaintainLoopCount {
 		if logStatus {
-			logrus.WithFields(logrus.Fields{
-				"maintainLoopCount":         maintainLoopCount,
-				"expectedMaintainLoopCount": expectedMaintainLoopCount,
-				"minMaintainLoopCount":      minMaintainLoopCount,
-				"recentRecords":             formatRelativeTimes(relativeTimes),
-			}).Infof("Possibly missed maintain loop")
+			slog.Info("Possibly missed maintain loop",
+				"maintainLoopCount", maintainLoopCount,
+				"expectedMaintainLoopCount", expectedMaintainLoopCount,
+				"minMaintainLoopCount", minMaintainLoopCount,
+				"recentRecords", formatRelativeTimes(relativeTimes),
+			)
 		}
 
 		return true
@@ -178,14 +183,14 @@ func checkMissedMaintainLoops(logStatus bool) bool {
 	// once when the maintain loop is stabilized, instead of printing
 	// every time when maintainLoopCount == minMaintainLoopCount (always
 	// this case if using maintainLoopCount), which could be very spammy.
-	if loopRecorder.GetRecordsIn(continuousLoopThreshold+loopInterval) == minMaintainLoopCount {
+	if d.loopRecorder.GetRecordsIn(d.continuousLoopThreshold+d.loopInterval) == minMaintainLoopCount {
 		if logStatus {
-			logrus.WithFields(logrus.Fields{
-				"maintainLoopCount":         maintainLoopCount,
-				"expectedMaintainLoopCount": expectedMaintainLoopCount,
-				"minMaintainLoopCount":      minMaintainLoopCount,
-				"recentRecords":             formatRelativeTimes(relativeTimes),
-			}).Infof("Maintain loop has been stabilized")
+			slog.Info("Maintain loop has been stabilized",
+				"maintainLoopCount", maintainLoopCount,
+				"expectedMaintainLoopCount", expectedMaintainLoopCount,
+				"minMaintainLoopCount", minMaintainLoopCount,
+				"recentRecords", formatRelativeTimes(relativeTimes),
+			)
 		}
 	}
 
@@ -195,79 +200,135 @@ func checkMissedMaintainLoops(logStatus bool) bool {
 // maintainLoop maintains the battery charge. It has the logic to
 // prevent parallel runs. So if one maintain loop is already running,
 // the next one will need to wait until the first one finishes.
-func maintainLoop() bool {
-	if isManagedChargeControl() {
-		return maintainLoopForced()
+func (d *Daemon) maintainLoop() bool {
+	if d.isManagedChargeControl() {
+		return d.maintainLoopForced()
 	}
 
-	defer loopRecorder.AddRecordNow()
+	defer d.loopRecorder.AddRecordNow()
 
-	if conf.PreventSystemSleep() {
+	if d.conf.PreventSystemSleep() {
 		// No need to keep track missed loops and wait post/before sleep delays, since
 		// prevent-system-sleep would prevent unexpected sleep during charging.
-		return maintainLoopInner(true)
+		return d.maintainLoopInner(true)
 	}
 
-	// See wg.Add() in sleepcallback.go for why we need to wait.
+	// See holdMaintainLoop in sleepcallback.go for why we need to wait.
 	tsBeforeWait := time.Now()
-	wg.Wait()
+	d.loopDelay.Wait()
 	tsAfterWait := time.Now()
 	if tsAfterWait.Sub(tsBeforeWait) > time.Second*1 {
-		logrus.Debugf("this maintain loop waited %d seconds after being initiated, now ready to execute", int(tsAfterWait.Sub(tsBeforeWait).Seconds()))
+		slog.Debug(fmt.Sprintf("this maintain loop waited %d seconds after being initiated, now ready to execute", int(tsAfterWait.Sub(tsBeforeWait).Seconds())))
 	}
 
 	// just log status, not doing anything, yet
-	_ = checkMissedMaintainLoops(true)
+	_ = d.checkMissedMaintainLoops(true)
 
 	// Missed-loop protection is the fallback for sleep transitions where macOS
 	// did not deliver a sleep notification. Disabling charging in that case is
 	// part of DisableChargingPreSleep's behavior, so honor the user's choice to
 	// let charging continue while the system is asleep.
-	return maintainLoopInner(!conf.DisableChargingPreSleep())
+	return d.maintainLoopInner(!d.conf.DisableChargingPreSleep())
 }
 
 // maintainLoopForced maintains the battery charge. It runs without waiting
 // for post/pre sleep delays, but yet has logic to prevent parallel runs.
 // It is mainly called by the HTTP APIs.
-func maintainLoopForced() bool {
-	return maintainLoopInner(true)
+func (d *Daemon) maintainLoopForced() bool {
+	return d.maintainLoopInner(true)
 }
 
-func handleNoMaintain(isChargingEnabled bool) bool {
+// maintainedCharging reports whether the last maintenance pass left charging
+// on because the battery is below the limit.
+func (d *Daemon) maintainedCharging() bool {
+	d.loopMu.Lock()
+	defer d.loopMu.Unlock()
+	return d.maintainedChargingInProgress
+}
+
+func (d *Daemon) handleNoMaintain(isChargingEnabled bool) bool {
 	if !isChargingEnabled {
-		logrus.Debug("limit set to 100%, but charging is disabled, enabling")
-		err := getCharger().Enable()
+		slog.Debug("limit set to 100%, but charging is disabled, enabling")
+		err := d.getCharger().Enable()
 		if err != nil {
-			logrus.Errorf("EnableCharging failed: %v", err)
+			slog.Error("EnableCharging failed", "error", err)
 			return false
 		}
 
+		if d.smc.CheckMagSafeExistence() {
+			switch d.conf.ControlMagSafeLED() {
+			case config.ControlMagSafeModeAlwaysOff:
+				err := d.smc.DisableMagSafeLed()
+				if err != nil {
+					// no fail
+					slog.Error("DisableMagSafeLed failed", "error", err)
+				}
+			default:
+				// Reset MagSafe LED to system state.
+				err = d.smc.SetMagSafeLedState(smc.LEDSystem)
+				if err != nil {
+					// no fail
+					slog.Error("SetMagSafeLedState(LEDSystem) failed", "error", err)
+				}
+			}
+		}
+	}
+
+	if d.smc.CheckMagSafeExistence() {
+		// Set MagSafe LED according to config.
+		currentMagSafeLEDState, err := d.smc.GetMagSafeLedState()
+		if err != nil {
+			// no fail
+			slog.Error("GetMagSafeLedState failed", "error", err)
+		}
+		switch d.conf.ControlMagSafeLED() {
+		case config.ControlMagSafeModeAlwaysOff:
+			if currentMagSafeLEDState != smc.LEDOff {
+				err := d.smc.DisableMagSafeLed()
+				if err != nil {
+					// no fail
+					slog.Error("DisableMagSafeLed failed", "error", err)
+				}
+			}
+		default:
+			// This applies to both ControlMagSafeModeEnabled and ControlMagSafeModeDisabled
+			// modes. Because in Disabled mode we should not interfere with the LED state,
+			// in Enabled mode we want to show the system state (which is the same as
+			// apple's default behavior when limit=100%).
+			if currentMagSafeLEDState != smc.LEDSystem {
+				err := d.smc.SetMagSafeLedState(smc.LEDSystem)
+				if err != nil {
+					// no fail
+					slog.Error("SetMagSafeLedState(LEDSystem) failed", "error", err)
+				}
+			}
+		}
 	}
 
 	// Calling this multiple times is no-op.
-	err := AllowSleepOnAC()
+	err := d.assertions.AllowSleepOnAC()
 	if err != nil {
-		logrus.Errorf("AllowSleepOnAC failed: %v", err)
+		slog.Error("AllowSleepOnAC failed", "error", err)
 	}
 
-	cancelCalibrationForPermanentDisable()
+	d.cancelCalibrationForPermanentDisable()
 
-	maintainedChargingInProgress = false
+	d.maintainedChargingInProgress = false
 	return true
 }
 
-func cancelCalibrationForPermanentDisable() {
+func (d *Daemon) cancelCalibrationForPermanentDisable() {
 	// A persisted temporary-disable/calibration conflict can be loaded after a
 	// restart. Calibration is restored paused for safety, so keep it intact and
 	// let the disable timer wait for the user to resume or cancel calibration.
-	if !conf.DisableUntil().IsZero() {
+	if !d.conf.DisableUntil().IsZero() {
 		return
 	}
-	cancelCalibrationNoRestoreNoError()
+	d.cancelCalibrationNoRestoreNoError()
 }
 
-func handleChargingLogic(ignoreMissedLoops, isChargingEnabled, isPluggedIn bool, batteryCharge, lower, upper int) bool {
-	maintainLoopsMissed := !ignoreMissedLoops && checkMissedMaintainLoops(false)
+func (d *Daemon) handleChargingLogic(ignoreMissedLoops, isChargingEnabled, isPluggedIn bool, batteryCharge, lower, upper int) bool {
+	maintainLoopsMissed := !ignoreMissedLoops && d.checkMissedMaintainLoops(false)
 
 	// Fix for #123.
 	// Consider this case:
@@ -279,18 +340,18 @@ func handleChargingLogic(ignoreMissedLoops, isChargingEnabled, isPluggedIn bool,
 	// there are too many missed maintain loops, even if the battery charge is
 	// below the lower limit, to prevent overcharging.
 	if isChargingEnabled && maintainLoopsMissed {
-		logrus.WithFields(logrus.Fields{
-			"batteryCharge": batteryCharge,
-			"lower":         lower,
-			"upper":         upper,
-		}).Infof("Too many missed maintain loops detected while charging is enabled. Disabling charging to prevent overcharging.")
-		err := getCharger().Disable()
+		slog.Info("Too many missed maintain loops detected while charging is enabled. Disabling charging to prevent overcharging.",
+			"batteryCharge", batteryCharge,
+			"lower", lower,
+			"upper", upper,
+		)
+		err := d.getCharger().Disable()
 		if err != nil {
-			logrus.Errorf("DisableCharging failed: %v", err)
+			slog.Error("DisableCharging failed", "error", err)
 			return false
 		}
 		isChargingEnabled = false
-		maintainedChargingInProgress = false
+		d.maintainedChargingInProgress = false
 	}
 
 	// Should enable charging.
@@ -302,54 +363,63 @@ func handleChargingLogic(ignoreMissedLoops, isChargingEnabled, isPluggedIn bool,
 		// before enabling charging, to avoid enabling charging when the
 		// system is in sleep mode, which could overcharge.
 		if !ignoreMissedLoops && maintainLoopsMissed {
-			logrus.WithFields(logrus.Fields{
-				"batteryCharge": batteryCharge,
-				"lower":         lower,
-				"upper":         upper,
-			}).Infof("Battery charge is below lower limit, but too many missed maintain loops are missed. Will wait until maintain loops are stable")
+			slog.Info("Battery charge is below lower limit, but too many missed maintain loops are missed. Will wait until maintain loops are stable",
+				"batteryCharge", batteryCharge,
+				"lower", lower,
+				"upper", upper,
+			)
 			return true
 		}
 
-		logrus.WithFields(logrus.Fields{
-			"batteryCharge": batteryCharge,
-			"lower":         lower,
-			"upper":         upper,
-		}).Infof("Battery charge is below lower limit, enabling charging")
-		err := getCharger().Enable()
+		slog.Info("Battery charge is below lower limit, enabling charging",
+			"batteryCharge", batteryCharge,
+			"lower", lower,
+			"upper", upper,
+		)
+		err := d.getCharger().Enable()
 		if err != nil {
-			logrus.Errorf("EnableCharging failed: %v", err)
+			slog.Error("EnableCharging failed", "error", err)
 			return false
 		}
 		isChargingEnabled = true
-		maintainedChargingInProgress = true
+		d.maintainedChargingInProgress = true
 	}
 
 	// Should disable charging.
 	if batteryCharge >= upper && isChargingEnabled {
-		logrus.WithFields(logrus.Fields{
-			"batteryCharge": batteryCharge,
-			"lower":         lower,
-			"upper":         upper,
-		}).Infof("Battery charge is above upper limit, disabling charging")
-		err := getCharger().Disable()
+		slog.Info("Battery charge is above upper limit, disabling charging",
+			"batteryCharge", batteryCharge,
+			"lower", lower,
+			"upper", upper,
+		)
+		err := d.getCharger().Disable()
 		if err != nil {
-			logrus.Errorf("DisableCharging failed: %v", err)
+			slog.Error("DisableCharging failed", "error", err)
 			return false
 		}
 		isChargingEnabled = false
-		maintainedChargingInProgress = false
+		d.maintainedChargingInProgress = false
 	}
 
-	if conf.PreventSystemSleep() {
+	switch d.conf.ControlMagSafeLED() {
+	case config.ControlMagSafeModeAlwaysOff:
+		_ = d.smc.DisableMagSafeLed()
+	case config.ControlMagSafeModeEnabled:
+		d.updateMagSafeLed(isChargingEnabled)
+	default:
+		// nothing
+	}
+
+	if d.conf.PreventSystemSleep() {
 		if isChargingEnabled {
-			err := PreventSleepOnAC()
+			err := d.assertions.PreventSleepOnAC()
 			if err != nil {
-				logrus.Errorf("PreventSleepOnAC failed: %v", err)
+				slog.Error("PreventSleepOnAC failed", "error", err)
 			}
 		} else {
-			err := AllowSleepOnAC()
+			err := d.assertions.AllowSleepOnAC()
 			if err != nil {
-				logrus.Errorf("AllowSleepOnAC failed: %v", err)
+				slog.Error("AllowSleepOnAC failed", "error", err)
 			}
 		}
 	}
@@ -360,95 +430,132 @@ func handleChargingLogic(ignoreMissedLoops, isChargingEnabled, isPluggedIn bool,
 	return true
 }
 
-func maintainLoopInner(ignoreMissedLoops bool) bool {
-	maintainLoopInnerLock.Lock()
-	defer maintainLoopInnerLock.Unlock()
+func (d *Daemon) maintainLoopInner(ignoreMissedLoops bool) bool {
+	d.loopMu.Lock()
+	defer d.loopMu.Unlock()
+	return d.maintainLoopLocked(ignoreMissedLoops)
+}
 
-	switch getCapabilities().ChargeControlMode {
+// maintainLoopLocked runs one pass while the caller holds loopMu.
+func (d *Daemon) maintainLoopLocked(ignoreMissedLoops bool) bool {
+	if d.chargeControlStopped {
+		return true
+	}
+
+	switch d.getCapabilities().ChargeControlMode {
 	case compatibility.ChargeControlFirmware, compatibility.ChargeControlNative:
-		return maintainManagedChargeLimit()
+		ok := d.maintainManagedChargeLimit()
+		d.maintainManagedMagSafeLED()
+		return ok
 	case compatibility.ChargeControlLegacy, compatibility.ChargeControlAdapter:
-		return maintainActiveCharging(ignoreMissedLoops)
+		return d.maintainActiveCharging(ignoreMissedLoops)
 	default:
-		maintainedChargingInProgress = false
+		d.maintainedChargingInProgress = false
 		return false
 	}
 }
 
-// maintainManagedChargeLimit delegates hysteresis enforcement to Apple (the
-// firmware or macOS's built-in limit). It deliberately does not read
-// battery/charging state or interact with sleep, MagSafe, adapter, or
-// calibration features.
-func maintainManagedChargeLimit() bool {
-	if calibrationNeedsMaintainLoop() {
-		batteryCharge, err := smcConn.GetBatteryCharge()
+// maintainManagedChargeLimit maintains Apple's charge control. Firmware takes
+// both thresholds directly; native mode keeps the configured upper limit
+// as the single target accepted by PowerUI.
+func (d *Daemon) maintainManagedChargeLimit() bool {
+	// Only the configured-limit path at the end can leave a target pending.
+	wasPending := int(d.pendingNativeLimit.Swap(0))
+	previousNoDrain := d.getNoDrainStatus()
+	if d.calibrationNeedsMaintainLoop() {
+		batteryCharge, err := d.smc.GetBatteryCharge()
 		if err != nil {
-			logrus.Errorf("GetBatteryCharge failed during calibration: %v", err)
+			slog.Error("GetBatteryCharge failed during calibration", "error", err)
 			return false
 		}
-		if applyCalibrationWithinLoop(batteryCharge) {
+		if d.applyCalibrationWithinLoop(batteryCharge) {
 			return true
 		}
 	}
 
-	if target := activeChargeOnceTarget(); target > 0 {
-		return maintainManagedChargeOnce(target)
+	if target := d.activeChargeOnceTarget(); target > 0 {
+		return d.maintainManagedChargeOnce(target)
 	}
 
-	upper := conf.UpperLimit()
+	mode := d.getCapabilities().ChargeControlMode
+	upper := d.conf.UpperLimit()
 	if upper >= 100 {
-		changed, err := ensureManagedChargeLimitDisabled()
+		changed, err := d.ensureManagedChargeLimitDisabled()
+		if handled, ok := d.noDrainMaintenanceResult(err, upper, previousNoDrain); handled {
+			d.maintainedChargingInProgress = false
+			return ok
+		}
 		if err != nil {
-			logrus.Errorf("failed to deactivate %s charge limit: %v", getCapabilities().ChargeControlMode, err)
+			slog.Error(fmt.Sprintf("failed to deactivate %s charge limit: %v", mode, err))
 			return false
 		}
 		if changed {
-			logrus.Infof("deactivated %s charge limit", getCapabilities().ChargeControlMode)
+			slog.Info(fmt.Sprintf("deactivated %s charge limit", mode))
 		}
-		maintainedChargingInProgress = false
+		d.maintainedChargingInProgress = false
 		return true
 	}
 
-	lower := conf.LowerLimit()
-	changed, err := ensureManagedChargeLimit(lower, upper)
-	if err != nil {
-		logrus.Errorf("failed to reconcile %s charge limit: %v", getCapabilities().ChargeControlMode, err)
+	lower := d.conf.LowerLimit()
+	changed, err := d.ensureManagedChargeLimit(lower, upper)
+	if handled, ok := d.noDrainMaintenanceResult(err, upper, previousNoDrain); handled {
+		d.maintainedChargingInProgress = false
+		return ok
+	}
+	switch {
+	case errors.Is(err, powerui.ErrRegistrationPending):
+		d.pendingNativeLimit.Store(int32(upper))
+		switch {
+		case wasPending == upper:
+			logging.Trace("native charge limit is waiting for macOS to apply it", "limit", upper)
+		case d.onBattery():
+			slog.Info("macOS applies the native charge limit once the Mac is connected to power", "limit", upper)
+		default:
+			slog.Info("macOS has not applied the native charge limit yet; it does so once the battery level changes or charging stops", "limit", upper)
+		}
+	case err != nil:
+		slog.Error(fmt.Sprintf("failed to reconcile %s charge limit: %v", mode, err))
 		return false
+	case changed:
+		slog.Info(fmt.Sprintf("reconciled %s charge limit", mode), "lower", lower, "upper", upper)
+	case wasPending == upper:
+		slog.Info("macOS applied the native charge limit", "limit", upper)
+	default:
+		logging.Trace(fmt.Sprintf("%s charge limit is correct", mode), "lower", lower, "upper", upper)
 	}
-	if changed {
-		logrus.WithFields(logrus.Fields{"lower": lower, "upper": upper}).Infof("reconciled %s charge limit", getCapabilities().ChargeControlMode)
-	} else {
-		logrus.WithFields(logrus.Fields{"lower": lower, "upper": upper}).Tracef("%s charge limit is correct", getCapabilities().ChargeControlMode)
-	}
-	maintainedChargingInProgress = false
+	d.maintainedChargingInProgress = false
 	return true
 }
 
 // maintainManagedChargeOnce temporarily overrides the Apple-managed charge
 // limit. Firmware supports a narrow band below the target; native macOS only
 // supports charging to full once by temporarily disabling its limit.
-func maintainManagedChargeOnce(target int) bool {
-	maintainedChargingInProgress = false
-	mode := getCapabilities().ChargeControlMode
+func (d *Daemon) maintainManagedChargeOnce(target int) bool {
+	d.maintainedChargingInProgress = false
+	mode := d.getCapabilities().ChargeControlMode
 
 	if target < 100 && mode != compatibility.ChargeControlFirmware {
-		logrus.Error("the native macOS backend cannot force a one-time charge below 100%")
+		slog.Error("the native macOS backend cannot force a one-time charge below 100%")
 		return false
 	}
 
+	previousNoDrain := d.getNoDrainStatus()
 	var changed bool
 	var err error
 	if target >= 100 {
-		changed, err = ensureManagedChargeLimitDisabled()
+		changed, err = d.ensureManagedChargeLimitDisabled()
 	} else {
-		changed, err = ensureManagedChargeLimit(target-1, target)
+		changed, err = d.ensureManagedChargeLimit(target-1, target)
+	}
+	if handled, ok := d.noDrainMaintenanceResult(err, target, previousNoDrain); handled {
+		return ok
 	}
 	if err != nil {
-		logrus.Errorf("failed to reconcile %s charge limit for a one-time charge: %v", mode, err)
+		slog.Error(fmt.Sprintf("failed to reconcile %s charge limit for a one-time charge: %v", mode, err))
 		return false
 	}
 	if changed {
-		logrus.WithField("target", target).Infof("reconciled %s charge limit for a one-time charge", mode)
+		slog.Info(fmt.Sprintf("reconciled %s charge limit for a one-time charge", mode), "target", target)
 	}
 	return true
 }
@@ -456,51 +563,61 @@ func maintainManagedChargeOnce(target int) bool {
 // maintainActiveCharging is the batt-managed hysteresis loop, shared by the
 // legacy (charge-key) and adapter (wall-power) backends. The only difference
 // between them is the charge switch it toggles.
-func maintainActiveCharging(ignoreMissedLoops bool) bool {
-
+func (d *Daemon) maintainActiveCharging(ignoreMissedLoops bool) bool {
+	conf := d.conf
 	upper := conf.UpperLimit()
 	lower := conf.LowerLimit()
+	mode := d.getCapabilities().ChargeControlMode
 	// Adapter mode holds the ceiling by discharging on battery and recharging,
 	// so keep a gentle minimum band to avoid frequent cycling and SMC writes.
-	if getCapabilities().ChargeControlMode == compatibility.ChargeControlAdapter {
+	if mode == compatibility.ChargeControlAdapter {
 		if minLower := upper - adapterMinBand; upper < 100 && lower > minLower && minLower >= 0 {
 			lower = minLower
 		}
 	}
 	maintain := upper < 100
 
-	isChargingEnabled, err := getCharger().IsEnabled()
+	isChargingEnabled, err := d.getCharger().IsEnabled()
 	if err != nil {
-		logrus.Errorf("charger.IsEnabled failed: %v", err)
+		slog.Error("charger.IsEnabled failed", "error", err)
 		return false
 	}
 
 	// Always get current battery charge to possibly drive calibration first.
-	batteryCharge, err := smcConn.GetBatteryCharge()
+	batteryCharge, err := d.smc.GetBatteryCharge()
 	if err != nil {
-		logrus.Errorf("GetBatteryCharge failed: %v", err)
+		slog.Error("GetBatteryCharge failed", "error", err)
 		return false
 	}
 
-	isPluggedIn, err := smcConn.IsPluggedIn()
+	isPluggedIn, err := d.smc.IsPluggedIn()
 	if err != nil {
-		logrus.Errorf("IsPluggedIn failed: %v", err)
+		slog.Error("IsPluggedIn failed", "error", err)
 		return false
 	}
 
-	chargeOnceTarget := activeChargeOnceTarget()
-	if chargeOnceTarget > 0 && getCapabilities().ChargeControlMode == compatibility.ChargeControlAdapter && nativeLimit.Supported() {
-		if _, err := ensureNativeChargeLimitDisabled(); err != nil {
-			logrus.WithError(err).Error("failed to clear native limit for adapter-mode one-time charge")
+	chargeOnceTarget := d.activeChargeOnceTarget()
+	if chargeOnceTarget > 0 && mode == compatibility.ChargeControlAdapter && d.native.Supported() {
+		if _, err := d.ensureNativeChargeLimitDisabled(); err != nil {
+			slog.Error("failed to clear native limit for adapter-mode one-time charge", "error", err)
 			return false
 		}
 	}
 
-	maintainedChargingInProgress = isChargingEnabled && isPluggedIn && calibrationState.Phase == calibration.PhaseIdle
-	printStatus(batteryCharge, lower, upper, chargeOnceTarget, isChargingEnabled, isPluggedIn, maintainedChargingInProgress, calibrationState.Phase != calibration.PhaseIdle)
+	calibrating := d.calibrationOwnsChargeLimit()
+	d.maintainedChargingInProgress = isChargingEnabled && isPluggedIn && !calibrating
+	d.printStatus(batteryCharge, lower, upper, chargeOnceTarget, isChargingEnabled, isPluggedIn, d.maintainedChargingInProgress, calibrating)
 
 	// If calibration is active, advance it and skip normal maintain logic.
-	if applyCalibrationWithinLoop(batteryCharge) {
+	if d.applyCalibrationWithinLoop(batteryCharge) {
+		switch conf.ControlMagSafeLED() {
+		case config.ControlMagSafeModeAlwaysOff:
+			_ = d.smc.DisableMagSafeLed()
+		case config.ControlMagSafeModeEnabled:
+			d.updateMagSafeLed(isChargingEnabled)
+		default:
+			// nothing
+		}
 		return true
 	}
 
@@ -509,27 +626,32 @@ func maintainActiveCharging(ignoreMissedLoops bool) bool {
 	// so charging starts right away instead of waiting for the charge to fall
 	// below the lower limit, and stops exactly at the target.
 	if chargeOnceTarget > 0 && batteryCharge < chargeOnceTarget {
-		return handleChargingLogic(ignoreMissedLoops, isChargingEnabled, isPluggedIn, batteryCharge, chargeOnceTarget, chargeOnceTarget)
+		return d.handleChargingLogic(ignoreMissedLoops, isChargingEnabled, isPluggedIn, batteryCharge, chargeOnceTarget, chargeOnceTarget)
 	}
 
 	// If maintain is disabled, we don't care about the battery charge, enable charging anyway.
 	if !maintain {
-		return handleNoMaintain(isChargingEnabled)
+		return d.handleNoMaintain(isChargingEnabled)
 	}
 
 	// Adapter mode can only enforce the limit while on wall power. When running
 	// from the battery there is nothing to cut or restore, so leave the adapter
 	// untouched and wait for reconnection instead of writing the SMC pointlessly.
 	// The next loop after reconnection resumes enforcement.
-	if getCapabilities().ChargeControlMode == compatibility.ChargeControlAdapter && !isPluggedIn {
-		maintainedChargingInProgress = false
+	if mode == compatibility.ChargeControlAdapter && !isPluggedIn {
+		d.maintainedChargingInProgress = false
 		return true
 	}
 
-	return handleChargingLogic(ignoreMissedLoops, isChargingEnabled, isPluggedIn, batteryCharge, lower, upper)
+	return d.handleChargingLogic(ignoreMissedLoops, isChargingEnabled, isPluggedIn, batteryCharge, lower, upper)
 }
 
-var lastPrintTime time.Time
+func (d *Daemon) updateMagSafeLed(isChargingEnabled bool) {
+	err := d.smc.SetMagSafeCharging(isChargingEnabled)
+	if err != nil {
+		slog.Error("SetMagSafeCharging failed", "error", err)
+	}
+}
 
 type loopStatus struct {
 	batteryCharge                int
@@ -542,9 +664,7 @@ type loopStatus struct {
 	calibrationInProgress        bool
 }
 
-var lastStatus loopStatus
-
-func printStatus(
+func (d *Daemon) printStatus(
 	batteryCharge int,
 	lower int,
 	upper int,
@@ -565,26 +685,33 @@ func printStatus(
 		calibrationInProgress:        calibrationInProgress,
 	}
 
-	fields := logrus.Fields{
-		"batteryCharge":                batteryCharge,
-		"lower":                        lower,
-		"upper":                        upper,
-		"chargeOnceTarget":             chargeOnceTarget,
-		"chargingEnabled":              isChargingEnabled,
-		"isPluggedIn":                  isPluggedIn,
-		"maintainedChargingInProgress": maintainedChargingInProgress,
-		"calibrationInProgress":        calibrationInProgress,
+	attrs := []any{
+		"batteryCharge", batteryCharge,
+		"lower", lower,
+		"upper", upper,
+		"chargeOnceTarget", chargeOnceTarget,
+		"chargingEnabled", isChargingEnabled,
+		"isPluggedIn", isPluggedIn,
+		"maintainedChargingInProgress", maintainedChargingInProgress,
+		"calibrationInProgress", calibrationInProgress,
 	}
 
-	defer func() { lastPrintTime = time.Now() }()
+	defer func() { d.lastPrintTime = time.Now() }()
 
 	// Skip printing if the last print was less than loopInterval+1 seconds ago and everything is the same.
-	if time.Since(lastPrintTime) < loopInterval+time.Second && reflect.DeepEqual(lastStatus, currentStatus) {
-		logrus.WithFields(fields).Trace("status")
+	if time.Since(d.lastPrintTime) < d.loopInterval+time.Second && reflect.DeepEqual(d.lastStatus, currentStatus) {
+		logging.Trace("status", attrs...)
 		return
 	}
 
-	logrus.WithFields(fields).Debug("status")
+	slog.Debug("status", attrs...)
 
-	lastStatus = currentStatus
+	d.lastStatus = currentStatus
+}
+
+// calibrationPhase returns the current calibration phase.
+func (d *Daemon) calibrationPhase() calibration.Phase {
+	d.calibrationMu.Lock()
+	defer d.calibrationMu.Unlock()
+	return d.calibrationState.Phase
 }

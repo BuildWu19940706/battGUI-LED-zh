@@ -104,6 +104,7 @@ static NSMenu *AddSubmenu(BattMenuController *controller,
         case BattItemDisableChargingPreSleep:
         case BattItemPreventSystemSleep:
         case BattItemPreventSleepOnAdapterDisable:
+        case BattItemNoDrain:
             sender.state = sender.state == NSControlStateValueOff
                 ? NSControlStateValueOn : NSControlStateValueOff;
             break;
@@ -212,8 +213,10 @@ void BattBuildMenu(BattMenuController *controller, NSString *version) {
     [root addItem:ActionItem(controller, BattLocalized(@"Install Daemon..."), @"i", BattItemInstall)];
     [root addItem:DisplayItem(controller, BattLocalized(@"Loading..."), BattItemState, NO)];
     [root addItem:DisplayItem(controller, BattLocalized(@"Loading..."), BattItemCurrentLimit, NO)];
-    [root addItem:DisplayItem(controller, @"", BattItemLEDStatus, NO)];
     [root addItem:ActionItem(controller, BattLocalized(@"Charge Range..."), @",", BattItemChargeRange)];
+    NSMenuItem *nativeLimitNotice = DisplayItem(controller, @"", BattItemNativeLimitNotice, NO);
+    nativeLimitNotice.hidden = YES;
+    [root addItem:nativeLimitNotice];
     [root addItem:[NSMenuItem separatorItem]];
     [root addItem:DisplayItem(controller, BattLocalized(@"Quick Limits"), BattItemQuickLimits, NO)];
 
@@ -259,6 +262,9 @@ void BattBuildMenu(BattMenuController *controller, NSString *version) {
     [advanced addItem:ActionItem(controller,
                                   BattLocalized(@"Prevent Sleep when Adapter is Disabled"), @"",
                                   BattItemPreventSleepOnAdapterDisable)];
+    [advanced addItem:ActionItem(controller,
+                                  BattLocalized(@"No-drain Above Native Limit (Experimental)"), @"",
+                                  BattItemNoDrain)];
     NSMenu *forceDischarge = AddSubmenu(controller, advanced, BattLocalized(@"Force Discharge..."),
                                         BattItemForceDischarge);
     NSMenuItem *forceDischargeCountdown = DisplayItem(controller, @"",

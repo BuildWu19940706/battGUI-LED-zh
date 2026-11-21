@@ -3,122 +3,94 @@ package daemon
 import (
 	"errors"
 	"net/http"
-	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/charlie0129/batt/pkg/calibration"
 	"github.com/charlie0129/batt/pkg/compatibility"
-	"github.com/charlie0129/batt/pkg/config"
 )
 
 func TestChargeRangeValidation(t *testing.T) {
-	oldConf, oldCaps, oldState := conf, capabilities, calibrationState
-	t.Cleanup(func() { conf, capabilities, calibrationState = oldConf, oldCaps, oldState })
-	cases := []struct {
-		body  string
-		caps  compatibility.Capabilities
-		phase calibration.Phase
-		want  int
+	const valid = `{"upper":80,"lower":78}`
+	for _, tc := range []struct {
+		name, body  string
+		mode        compatibility.ChargeControlMode
+		calibrating bool
+		status      int
 	}{
-		{`{"upper":80,"lower":78}`, compatibility.Capabilities{ChargingControl: true, ChargeControlMode: compatibility.ChargeControlFirmware}, calibration.PhaseCharge, 400},
-		{`{"upper":80,"lower":80}`, compatibility.Capabilities{ChargingControl: true}, calibration.PhaseIdle, 400},
-		{`{"upper":101,"lower":78}`, compatibility.Capabilities{ChargingControl: true}, calibration.PhaseIdle, 400},
-		{`{"upper":80}`, compatibility.Capabilities{ChargingControl: true}, calibration.PhaseIdle, 400},
-		{`null`, compatibility.Capabilities{ChargingControl: true}, calibration.PhaseIdle, 400},
-		{`{"upper":80,"lower":9}`, compatibility.Capabilities{ChargingControl: true}, calibration.PhaseIdle, 400},
-		{`{"upper":80.5,"lower":78}`, compatibility.Capabilities{ChargingControl: true}, calibration.PhaseIdle, 400},
-		{`{"upper":80,"lower":78}`, compatibility.Capabilities{}, calibration.PhaseIdle, 409},
-		{`{"upper":80,"lower":78}`, compatibility.Capabilities{ChargingControl: true, ChargeControlMode: compatibility.ChargeControlNative}, calibration.PhaseIdle, 409},
-	}
-	for _, tc := range cases {
-		t.Run(tc.body+string(tc.phase)+string(tc.caps.ChargeControlMode), func(t *testing.T) {
-			configured := &mockConf{upper: 80, lower: 78}
-			conf = configured
-			capabilities = tc.caps
-			calibrationState = &calibration.State{Phase: tc.phase}
-			res := requestChargeRange(tc.body)
-			if res.Code != tc.want {
-				t.Fatalf("status=%d want=%d body=%s", res.Code, tc.want, res.Body)
+		{"calibration", valid, compatibility.ChargeControlFirmware, true, 400},
+		{"zero width", `{"upper":80,"lower":80}`, compatibility.ChargeControlFirmware, false, 400},
+		{"upper too high", `{"upper":101,"lower":78}`, compatibility.ChargeControlFirmware, false, 400},
+		{"missing lower", `{"upper":80}`, compatibility.ChargeControlFirmware, false, 400},
+		{"null", `null`, compatibility.ChargeControlFirmware, false, 400},
+		{"lower too low", `{"upper":80,"lower":9}`, compatibility.ChargeControlFirmware, false, 400},
+		{"fraction", `{"upper":80.5,"lower":78}`, compatibility.ChargeControlFirmware, false, 400},
+		{"short adapter band", valid, compatibility.ChargeControlAdapter, false, 400},
+		{"unsupported", valid, compatibility.ChargeControlUnsupported, false, 409},
+		{"native", valid, compatibility.ChargeControlNative, false, 409},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t, firmwareManaged, withCapabilities(compatibility.Capabilities{
+				ChargingControl: tc.mode != compatibility.ChargeControlUnsupported, ChargeControlMode: tc.mode,
+			}))
+			if tc.calibrating {
+				f.setCalibration(&calibration.State{Phase: calibration.PhaseCharge})
 			}
-			if configured.upper != 80 || configured.lower != 78 {
-				t.Fatalf("rejected request changed range: %+v", configured)
+			before := f.mem.snapshot()
+			f.mustServe(http.MethodPut, "/charge-range", tc.body, tc.status)
+			if got := f.mem.snapshot(); got != before {
+				t.Fatalf("rejected range changed config: %+v", got)
 			}
 		})
 	}
 }
 
 func TestChargeRangePersistsAndAppliesTogether(t *testing.T) {
-	configured := &mockConf{upper: 80, lower: 78, chargeOnceTarget: 100}
-	mock := firmwareChargeMock(t)
-	useFirmwareLoopState(t, mock, configured)
-	file, path := useTempConfig(t)
-	file.SetChargeOnceTarget(100)
-	res := requestChargeRange(`{"upper":70,"lower":60}`)
-	if res.Code != 201 {
-		t.Fatalf("status=%d body=%s", res.Code, res.Body)
+	f := newFixture(t, firmwareManaged, withFileConfig())
+	f.file.SetChargeOnceTarget(100)
+	f.file.SetDisableTimer(time.Now().Add(time.Hour), 85)
+	f.mustServe(http.MethodPut, "/charge-range", `{"upper":70,"lower":60}`, http.StatusCreated)
+	saved := f.reloadFile()
+	if saved.UpperLimit() != 70 || saved.LowerLimit() != 60 || saved.ChargeOnceTarget() != 0 || !saved.DisableUntil().IsZero() {
+		t.Fatalf("incorrect saved range or workflow: %v", saved.LogValue())
 	}
-	stored, err := config.NewFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if stored.UpperLimit() != 70 || stored.LowerLimit() != 60 || stored.ChargeOnceTarget() != 0 {
-		t.Fatalf("incorrect saved range/workflow: %+v", stored.LogrusFields())
-	}
-	got, err := mock.GetFirmwareChargeLimit()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !got.Active || got.Upper != 70 || got.Lower != 60 {
-		t.Fatalf("hardware range=%+v", got)
+	got, err := f.smc.GetFirmwareChargeLimit()
+	if err != nil || !got.Active || got.Upper != 70 || got.Lower != 60 {
+		t.Fatalf("hardware range = %+v, %v", got, err)
 	}
 }
 
 func TestChargeRangeApplyFailureRollsBack(t *testing.T) {
-	configured := &mockConf{upper: 80, lower: 78, chargeOnceTarget: 100}
-	// No firmware keys: a simulated hardware error after persistence.
-	mock := useMockSMC(t)
-	useFirmwareLoopState(t, mock, configured)
-	file, path := useTempConfig(t)
-	file.SetChargeOnceTarget(100)
-	if err := file.Save(); err != nil {
+	f := newFixture(t, firmwareManaged, withFileConfig())
+	until := time.Now().Add(time.Hour)
+	f.file.SetChargeRange(80, 78)
+	f.file.SetDisableTimer(until, 85)
+	f.file.SetChargeOnceTarget(100)
+	if err := f.file.Save(); err != nil {
 		t.Fatal(err)
 	}
-	res := requestChargeRange(`{"upper":70,"lower":60}`)
-	if res.Code != 500 {
-		t.Fatalf("status=%d body=%s", res.Code, res.Body)
+	f.smc.fail("EnsureFirmwareChargeLimit", errors.New("cannot apply range"))
+	f.mustServe(http.MethodPut, "/charge-range", `{"upper":70,"lower":60}`, http.StatusInternalServerError)
+	saved := f.reloadFile()
+	if saved.UpperLimit() != 80 || saved.LowerLimit() != 78 || saved.ChargeOnceTarget() != 100 || !saved.DisableUntil().Equal(until) || saved.PreDisableLimit() != 85 {
+		t.Fatalf("rollback lost config: %v", saved.LogValue())
 	}
-	stored, err := config.NewFile(path)
-	if err != nil {
-		t.Fatal(err)
+	if f.smc.callCount("EnsureFirmwareChargeLimitDisabled") != 1 {
+		t.Fatal("rollback did not restore one-time full charging on hardware")
 	}
-	if stored.UpperLimit() != 80 || stored.LowerLimit() != 78 || stored.ChargeOnceTarget() != 100 {
-		t.Fatalf("rollback lost config: %v target=%d", stored.LogrusFields(), stored.ChargeOnceTarget())
-	}
-}
-
-func requestChargeRange(body string) *httptest.ResponseRecorder {
-	req := httptest.NewRequest(http.MethodPut, "/charge-range", strings.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	res := httptest.NewRecorder()
-	setupRoutes().ServeHTTP(res, req)
-	return res
 }
 
 func TestChargeRangeSaveFailurePreservesWorkflow(t *testing.T) {
-	oldConf, oldCaps, oldState := conf, capabilities, calibrationState
-	t.Cleanup(func() { conf, capabilities, calibrationState = oldConf, oldCaps, oldState })
-	until := time.Now().Add(time.Hour)
-	configured := &mockConf{upper: 100, lower: 98, disableUntil: until, preDisableLimit: 80, chargeOnceTarget: 100, saveErr: errors.New("disk full")}
-	conf = configured
-	capabilities = compatibility.Capabilities{ChargingControl: true, ChargeControlMode: compatibility.ChargeControlFirmware}
-	calibrationState = &calibration.State{Phase: calibration.PhaseIdle}
-	res := requestChargeRange(`{"upper":70,"lower":65}`)
-	if res.Code != 500 {
-		t.Fatalf("status=%d body=%s", res.Code, res.Body)
+	f := newFixture(t, firmwareManaged)
+	f.mem.SetDisableTimer(time.Now().Add(time.Hour), 80)
+	f.mem.SetChargeOnceTarget(100)
+	before := f.mem.snapshot()
+	f.mem.failSave(errors.New("disk full"))
+	f.mustServe(http.MethodPut, "/charge-range", `{"upper":70,"lower":65}`, http.StatusInternalServerError)
+	if got := f.mem.snapshot(); got != before {
+		t.Fatalf("failed transaction lost config: %+v", got)
 	}
-	if configured.upper != 100 || configured.lower != 98 || configured.chargeOnceTarget != 100 || !configured.disableUntil.Equal(until) || configured.preDisableLimit != 80 {
-		t.Fatalf("failed transaction lost previous configuration: %+v", configured)
+	if f.smc.callCount("EnsureFirmwareChargeLimit") != 0 {
+		t.Fatal("failed save applied the range")
 	}
 }

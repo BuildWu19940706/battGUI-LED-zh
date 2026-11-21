@@ -1,9 +1,8 @@
 package config
 
 import (
+	"log/slog"
 	"time"
-
-	"github.com/sirupsen/logrus"
 )
 
 type Config interface {
@@ -15,6 +14,7 @@ type Config interface {
 	PreventSleepOnAdapterDisable() bool
 	AllowNonRootAccess() bool
 	AdapterMode() bool
+	NoDrain() bool
 	ControlMagSafeLED() ControlMagSafeMode
 	CalibrationDischargeThreshold() int
 	CalibrationHoldDurationMinutes() int
@@ -33,6 +33,7 @@ type Config interface {
 	SetPreventSleepOnAdapterDisable(bool)
 	SetAllowNonRootAccess(bool)
 	SetAdapterMode(bool)
+	SetNoDrain(bool)
 	SetControlMagSafeLED(ControlMagSafeMode)
 	SetCron(string)
 	SetCalibrationDischargeThreshold(int)
@@ -44,7 +45,8 @@ type Config interface {
 	SetChargeOnceTarget(int)
 	ClearChargeOnceTarget()
 
-	LogrusFields() logrus.Fields
+	// LogValue renders the settings for a log line.
+	LogValue() slog.Value
 
 	// Load reads the configuration from the source.
 	Load() error

@@ -76,3 +76,6 @@ vendor
 repomix-output.xml
 /.superpowers/
 /dist/
+
+# Mkdocs
+/site/

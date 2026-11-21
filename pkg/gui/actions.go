@@ -1,13 +1,14 @@
 package gui
 
 import (
+	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 	"time"
 
 	pkgerrors "github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 
 	"github.com/charlie0129/batt/pkg/client"
 	"github.com/charlie0129/batt/pkg/config"
@@ -41,6 +42,8 @@ func (c *menuController) handleAction(item menuItem, checked bool) {
 		c.setPreventSystemSleep(checked)
 	case itemPreventSleepOnAdapterDisable:
 		c.setPreventSleepOnAdapterDisable(checked)
+	case itemNoDrain:
+		c.setNoDrain(checked)
 	case itemForceDischargeStop:
 		c.stopForceDischarge()
 	case itemForceDischargeIndefinitely:
@@ -80,18 +83,18 @@ func (c *menuController) handleAction(item menuItem, checked bool) {
 func (c *menuController) installOrUpgrade() {
 	executable, err := os.Executable()
 	if err != nil {
-		logrus.WithError(err).Error(tr("Failed to get executable path"))
-		showAlert(tr("Failed to get executable path"), err.Error())
+		slog.Error("Failed to get executable path", "error", err)
+		showAlert("Failed to get executable path", err.Error())
 		return
 	}
 	if err := installDaemon(executable); err != nil {
-		logrus.WithError(err).Error(tr("Failed to install daemon"))
-		showAlert(tr("Installation failed"), err.Error())
+		slog.Error("Failed to install daemon", "error", err)
+		showAlert("Installation failed", err.Error())
 		return
 	}
 	if err := startAppAtBoot(); err != nil {
-		logrus.WithError(err).Error(tr("Failed to start app at boot"))
-		showAlert(tr("Failed to start app at boot"), err.Error())
+		slog.Error("Failed to start app at boot", "error", err)
+		showAlert("Failed to start app at boot", err.Error())
 		return
 	}
 	c.menu.setStatusIcon(true, true, false)
@@ -100,15 +103,15 @@ func (c *menuController) installOrUpgrade() {
 func (c *menuController) setLimit(limit int) {
 	response, err := c.api.SetLimit(limit)
 	if err != nil {
-		logrus.WithError(err).Error(tr("Failed to set limit"))
-		showAlert(tr("Failed to set limit"), response+err.Error())
+		slog.Error("Failed to set limit", "error", err)
+		showAlert("Failed to set limit", response+err.Error())
 	}
 }
 
 func (c *menuController) callChargeOnce(call func() (string, error), failure string) {
 	response, err := call()
 	if err != nil {
-		logrus.WithError(err).Error(failure)
+		slog.Error(failure, "error", err)
 		showAlert(failure, response+err.Error())
 	}
 }
@@ -132,24 +135,22 @@ func chargeOnceStatusTitle(target, currentCharge int) string {
 
 func (c *menuController) setMagSafeMode(mode config.ControlMagSafeMode) {
 	if _, err := c.api.SetControlMagSafeLED(mode); err != nil {
-		logrus.WithError(err).Error("Failed to set control mag safe LED")
-		showAlert(tr("Failed to set MagSafe LED control"), err.Error())
+		slog.Error("Failed to set control mag safe LED", "error", err)
+		showAlert("Failed to set MagSafe LED control", err.Error())
 	}
-	c.refreshOnOpen()
-	c.updateTelemetry()
 }
 
 func (c *menuController) setPreventIdleSleep(checked bool) {
 	if _, err := c.api.SetPreventIdleSleep(checked); err != nil {
-		logrus.WithError(err).Error(tr("Failed to set prevent idle sleep"))
-		showAlert(tr("Failed to set prevent idle sleep"), err.Error())
+		slog.Error("Failed to set prevent idle sleep", "error", err)
+		showAlert("Failed to set prevent idle sleep", err.Error())
 	}
 }
 
 func (c *menuController) setDisableChargingPreSleep(checked bool) {
 	if _, err := c.api.SetDisableChargingPreSleep(checked); err != nil {
-		logrus.WithError(err).Error("Failed to set disable charging pre sleep")
-		showAlert(tr("Failed to set prevent idle sleep"), err.Error())
+		slog.Error("Failed to set disable charging pre sleep", "error", err)
+		showAlert("Failed to set prevent idle sleep", err.Error())
 	}
 }
 
@@ -162,7 +163,7 @@ func (c *menuController) setPreventSystemSleep(checked bool) {
 func (c *menuController) setPreventSleepOnAdapterDisable(checked bool) {
 	if checked {
 		if !showConfirmation(confirmPreventSleepOnAdapterDisable) {
-			logrus.Info("User cancelled prevent sleep on adapter disable")
+			slog.Info("User cancelled prevent sleep on adapter disable")
 			c.menu.setChecked(itemPreventSleepOnAdapterDisable, false)
 			return
 		}
@@ -173,13 +174,43 @@ func (c *menuController) setPreventSleepOnAdapterDisable(checked bool) {
 	}
 }
 
+func (c *menuController) setNoDrain(checked bool) {
+	if checked && !showConfirmation(confirmNoDrain) {
+		c.menu.setChecked(itemNoDrain, false)
+		return
+	}
+	response, err := c.api.SetNoDrain(checked)
+	if err != nil {
+		c.menu.setChecked(itemNoDrain, !checked)
+		showAlert("Failed to set no-drain", err.Error())
+		return
+	}
+	// A deferred restart or a fallback is useful information, but a normal
+	// enable/disable response does not need to interrupt the menu interaction.
+	if strings.Contains(response, "turned off") || strings.Contains(response, "could not be applied safely") {
+		// The daemon rejected the policy and restored regular native control.
+		c.menu.setChecked(itemNoDrain, false)
+	}
+	if checked && (strings.Contains(response, "deferred") || strings.Contains(response, "could not")) {
+		var message string
+		if err := json.Unmarshal([]byte(response), &message); err != nil {
+			message = response
+		}
+		// Keep the daemon's diagnostic details after the localized status message.
+		if summary, detail, ok := strings.Cut(message, ". "); ok {
+			message = tr(summary+".") + "\n\n" + detail
+		}
+		showAlert("No-drain", message)
+	}
+}
+
 func (c *menuController) startForceDischarge(duration time.Duration) {
 	confirmation := confirmForceDischarge
 	if duration == 0 {
 		confirmation = confirmForceDischargeIndefinitely
 	}
 	if !showConfirmation(confirmation) {
-		logrus.Info("User cancelled force discharge")
+		slog.Info("User cancelled force discharge")
 		return
 	}
 	var err error
@@ -201,7 +232,7 @@ func (c *menuController) stopForceDischarge() {
 
 func (c *menuController) startCalibration() {
 	if !showConfirmation(confirmStartCalibration) {
-		logrus.Info("User cancelled auto calibration")
+		slog.Info("User cancelled auto calibration")
 		return
 	}
 	if _, err := c.api.StartCalibration(); err != nil {
@@ -234,18 +265,18 @@ func (c *menuController) cancelCalibration() {
 func (c *menuController) uninstall() {
 	executable, err := os.Executable()
 	if err != nil {
-		logrus.WithError(err).Error(tr("Failed to get executable path"))
-		showAlert(tr("Failed to get executable path"), err.Error())
+		slog.Error("Failed to get executable path", "error", err)
+		showAlert("Failed to get executable path", err.Error())
 		return
 	}
 	if err := uninstallDaemon(executable); err != nil {
-		logrus.WithError(err).Error(tr("Failed to uninstall daemon"))
-		showAlert(tr("Failed to uninstall daemon"), err.Error())
+		slog.Error("Failed to uninstall daemon", "error", err)
+		showAlert("Failed to uninstall daemon", err.Error())
 		return
 	}
 	if err := UnregisterLoginItem(); err != nil {
-		logrus.WithError(err).Error(tr("Failed to unregister login item"))
-		showAlert(tr("Failed to unregister login item"), err.Error())
+		slog.Error("Failed to unregister login item", "error", err)
+		showAlert("Failed to unregister login item", err.Error())
 		return
 	}
 	c.menu.setStatusIcon(false, true, false)
@@ -338,9 +369,9 @@ func formatTemporaryDisableRemaining(remaining time.Duration) string {
 
 func (c *menuController) quit() {
 	if c.eventCancel != nil {
-		logrus.Debug("Cancelling event subscription")
+		slog.Debug("Cancelling event subscription")
 		c.eventCancel()
 	}
-	logrus.Info("Quitting client")
+	slog.Info("Quitting client")
 	terminateNativeApp()
 }

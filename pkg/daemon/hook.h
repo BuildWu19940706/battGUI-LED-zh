@@ -4,8 +4,7 @@ extern void canSystemSleepCallback();
 extern void systemWillSleepCallback();
 extern void systemWillPowerOnCallback();
 extern void systemHasPoweredOnCallback();
-extern void powerSourceChangedCallback(int connected);
-extern void powerAdapterChangedCallback();
+extern void powerConnectionChangedCallback();
 
 int AllowPowerChange();
 int CancelPowerChange();

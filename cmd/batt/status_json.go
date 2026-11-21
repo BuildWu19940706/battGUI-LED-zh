@@ -8,6 +8,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/charlie0129/batt/pkg/calibration"
+	"github.com/charlie0129/batt/pkg/client"
 	"github.com/charlie0129/batt/pkg/compatibility"
 	"github.com/charlie0129/batt/pkg/config"
 	"github.com/charlie0129/batt/pkg/powerinfo"
@@ -23,9 +24,11 @@ type statusJSON struct {
 }
 
 type statusChargingJSON struct {
-	AllowCharging *bool `json:"allowCharging,omitempty"`
-	UseAdapter    *bool `json:"useAdapter,omitempty"`
-	PluggedIn     bool  `json:"pluggedIn"`
+	AllowCharging          *bool `json:"allowCharging,omitempty"`
+	UseAdapter             *bool `json:"useAdapter,omitempty"`
+	PluggedIn              bool  `json:"pluggedIn"`
+	ChargingToFullOverride *bool `json:"chargingToFullOverride,omitempty"`
+	ChargeLimitPending     *bool `json:"chargeLimitPending,omitempty"`
 }
 
 type statusBatteryJSON struct {
@@ -48,7 +51,8 @@ type statusConfigJSON struct {
 	AllowNonRootAccess           bool                 `json:"allowNonRootAccess"`
 	ControlMagSafeLed            statusMagSafeLedJSON `json:"controlMagSafeLed"`
 	// ChargeOnceTargetPercent is null when no one-time charge is running.
-	ChargeOnceTargetPercent *int `json:"chargeOnceTargetPercent"`
+	ChargeOnceTargetPercent *int                  `json:"chargeOnceTargetPercent"`
+	NoDrain                 *client.NoDrainStatus `json:"noDrain,omitempty"`
 }
 
 type statusMagSafeLedJSON struct {
@@ -123,9 +127,11 @@ func printStatusJSON(cmd *cobra.Command, data *statusData, cfg *config.File) err
 
 	out := statusJSON{
 		Charging: statusChargingJSON{
-			AllowCharging: allowCharging,
-			UseAdapter:    useAdapter,
-			PluggedIn:     data.pluggedIn,
+			AllowCharging:          allowCharging,
+			UseAdapter:             useAdapter,
+			PluggedIn:              data.pluggedIn,
+			ChargingToFullOverride: data.batteryInfo.ChargingToFullOverride,
+			ChargeLimitPending:     data.batteryInfo.ChargeLimitPending,
 		},
 		Battery: statusBatteryJSON{
 			CurrentChargePercent: data.currentCharge,
@@ -149,6 +155,7 @@ func printStatusJSON(cmd *cobra.Command, data *statusData, cfg *config.File) err
 				Mode:    string(mode),
 			},
 			ChargeOnceTargetPercent: chargeOnceTarget,
+			NoDrain:                 data.noDrain,
 		},
 		Compatibility: data.capabilities,
 	}

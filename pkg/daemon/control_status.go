@@ -1,160 +1,104 @@
 package daemon
 
 import (
-	"errors"
 	"sync"
 	"time"
 
-	"github.com/charlie0129/batt/pkg/calibration"
 	"github.com/charlie0129/batt/pkg/compatibility"
-	"github.com/charlie0129/batt/pkg/config"
 	"github.com/charlie0129/batt/pkg/powerinfo"
-	"github.com/charlie0129/batt/pkg/smc"
-	"github.com/peterneutron/powerkit-go/pkg/powerkit"
 )
 
-var errLEDReadback = errors.New("MagSafe readback did not match requested state")
+// controlStatus holds the GUI's evidence of reaching a target during the
+// current uninterrupted power connection. It only observes charging.
+type controlStatus struct {
+	mu        sync.Mutex
+	tracker   powerinfo.ControlTracker
+	snapshot  powerinfo.ControlStatus
+	suspended bool
+}
 
-var controlState = struct {
-	sync.Mutex
-	tracker         powerinfo.ControlTracker
-	snapshot        powerinfo.ControlStatus
-	suspended       bool
-	connectionKnown bool
-	connected       bool
-}{}
-var statusLED ledController
-
-// refreshControlStatus is run after the charging loop, never from automated
-// loop tests or the GUI. Charging decisions and LED decisions stay independent.
-func refreshControlStatus() {
-	chargeControlTransitionMu.Lock()
-	defer chargeControlTransitionMu.Unlock()
-	maintainLoopInnerLock.Lock()
-	defer maintainLoopInnerLock.Unlock()
-	if smcConn == nil || conf == nil {
+func (d *Daemon) refreshControlStatus(applied bool) {
+	d.transitionMu.Lock()
+	defer d.transitionMu.Unlock()
+	d.loopMu.Lock()
+	defer d.loopMu.Unlock()
+	if d.chargeControlStopped {
 		return
 	}
-	in := powerinfo.ControlInput{Now: time.Now(), Target: conf.UpperLimit(), ConfiguredUpper: conf.UpperLimit(), Lower: conf.LowerLimit()}
-	if target := conf.ChargeOnceTarget(); target > 0 {
-		in.Target = target
-		in.Lower = target
+
+	calibrating := d.calibrationOwnsChargeLimit()
+	caps := d.getCapabilities()
+	s := &d.control
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	upper, lower := d.conf.UpperLimit(), d.conf.LowerLimit()
+	in := powerinfo.ControlInput{
+		Now: time.Now(), ConfiguredUpper: upper, Target: upper, Lower: lower,
+		Calibrating: calibrating, Suspended: s.suspended,
 	}
-	charge, e1 := smcConn.GetBatteryCharge()
-	plugged, e2 := smcConn.IsPluggedIn()
+	switch caps.ChargeControlMode {
+	case compatibility.ChargeControlAdapter:
+		if upper < 100 {
+			in.Lower = min(lower, upper-adapterMinBand)
+		}
+	case compatibility.ChargeControlNative:
+		// macOS exposes one target. It does not report the lower threshold.
+		in.NativeLimit = true
+		in.Lower = upper
+	}
+	if target := d.conf.ChargeOnceTarget(); target > 0 && !calibrating {
+		in.Target, in.Lower = target, target
+	}
+	charge, chargeErr := d.smc.GetBatteryCharge()
+	plugged, powerErr := d.smc.IsPluggedIn()
+	battery, batteryErr := d.battery.Snapshot()
+	in.Valid = applied && caps.ChargingControl && chargeErr == nil && powerErr == nil && batteryErr == nil
 	in.Charge, in.PluggedIn = charge, plugged
-	info, e3 := powerkit.GetSystemInfo(powerkit.FetchOptions{QueryIOKit: true, QuerySMC: false})
-	in.Valid = e1 == nil && e2 == nil && e3 == nil && info != nil && info.IOKit != nil
-	if in.Valid {
-		in.Charging = info.IOKit.State.IsCharging
-		in.Full = info.IOKit.State.FullyCharged
-		in.Discharging = info.IOKit.Calculations.BatteryPower < -0.5
-	}
-	caps := getCapabilities()
+	in.Charging, in.Full = battery.Charging, battery.FullyCharged
+	in.Discharging = battery.BatteryPower() < -0.5
 	if caps.AdapterControl {
-		enabled, err := smcIsAdapterEnabled()
-		if err != nil {
+		enabled, err := d.smc.IsAdapterEnabled()
+		in.Valid = in.Valid && err == nil
+		in.ForcedDischarge = !enabled
+	}
+	if caps.ChargeControlMode == compatibility.ChargeControlNative {
+		if override, err := d.battery.FullChargeOverride(); err == nil && override {
+			in.Target, in.Lower = 100, 100
+		}
+		if plugged && (d.pendingNativeLimit.Load() != 0 || d.getNoDrainStatus().Phase == noDrainWaiting) {
 			in.Valid = false
-		} else {
-			in.ForcedDischarge = !enabled
 		}
 	}
-	calibrationMu.Lock()
-	in.Calibrating = calibrationState.Phase != calibration.PhaseIdle
-	calibrationMu.Unlock()
-	controlState.Lock()
-	defer controlState.Unlock()
-	in.Suspended = controlState.suspended
-	snapshot := controlState.tracker.Update(in)
-	mode := conf.ControlMagSafeLED()
-	desired, name := desiredMagSafeLED(in, snapshot.State, mode, caps.MagSafeLED)
-	statusLED.apply(desired, caps.MagSafeLED, smcConn.SetMagSafeLedState, smcConn.GetMagSafeLedState)
-	snapshot.LED = currentLEDStatus(caps, mode, name)
-	controlState.snapshot = snapshot
+	s.snapshot = s.tracker.Update(in)
 }
 
-func desiredMagSafeLED(in powerinfo.ControlInput, state string, mode config.ControlMagSafeMode, available bool) (smc.MagSafeLedState, string) {
-	if !available || !in.Valid || !in.PluggedIn || in.Suspended {
-		return smc.LEDSystem, "system"
+func (d *Daemon) getControlStatus() powerinfo.ControlStatus {
+	s := &d.control
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.snapshot.SampledAt.IsZero() || time.Since(s.snapshot.SampledAt) > 30*time.Second {
+		s.reset()
 	}
-	switch mode {
-	case config.ControlMagSafeModeAlwaysOff:
-		return smc.LEDOff, "off"
-	case config.ControlMagSafeModeEnabled:
-		if state == "unknown" {
-			return smc.LEDSystem, "system"
-		}
-		// 每次采样按当前充电标志和有效目标选色，重新插电无需等待新的达标记录。
-		if in.Charging && in.Charge < in.Target {
-			return smc.LEDOrange, "orange"
-		}
-		return smc.LEDGreen, "green"
-	default:
-		return smc.LEDSystem, "system"
-	}
+	return s.snapshot
 }
 
-func currentLEDStatus(caps compatibility.Capabilities, mode config.ControlMagSafeMode, desired string) powerinfo.LEDStatus {
-	status := powerinfo.LEDStatus{InterfacePresent: caps.MagSafeLEDInterface, Available: caps.MagSafeLED, Reason: caps.MagSafeLEDReason, Mode: string(mode), Desired: desired}
-	if failed, pending := statusLED.failureState(); failed {
-		status.Available, status.Desired, status.Reason = false, "system", "write_failed"
-		if pending {
-			status.Reason = "release_failed"
-		}
-	}
-	return status
+func (s *controlStatus) reset() {
+	s.tracker.Reset()
+	s.snapshot = powerinfo.ControlStatus{State: "unknown", Reason: "data_unavailable"}
 }
 
-// Refresh LED telemetry after a manual baseline attempt without resetting the
-// independent evidence that the charge target has been reached.
-func recordLEDRecovery() {
-	controlState.Lock()
-	defer controlState.Unlock()
-	controlState.snapshot.LED = currentLEDStatus(getCapabilities(), conf.ControlMagSafeLED(), "system")
+func (d *Daemon) invalidateControlStatus() {
+	s := &d.control
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reset()
 }
 
-func getControlStatus() powerinfo.ControlStatus {
-	controlState.Lock()
-	defer controlState.Unlock()
-	snapshot := controlState.snapshot
-	if snapshot.SampledAt.IsZero() || time.Since(snapshot.SampledAt) > 30*time.Second {
-		snapshot.State, snapshot.Reason = "unknown", "data_unavailable"
-		controlState.tracker.Reset()
-	}
-	return snapshot
-}
-
-func suspendControlStatus(suspended bool) {
-	controlState.Lock()
-	defer controlState.Unlock()
-	controlState.suspended = suspended
-	controlState.tracker.Reset()
-	controlState.snapshot.State, controlState.snapshot.Reason = "unknown", "data_unavailable"
-	controlState.snapshot.SampledAt = time.Time{}
-	if smcConn != nil {
-		statusLED.apply(smc.LEDSystem, false, smcConn.SetMagSafeLedState, smcConn.GetMagSafeLedState)
-	}
-}
-
-// Invalidate synchronously at the mutation boundary, including changes away
-// and back between polling samples. Do not change the actual sleep state.
-func invalidateControlStatus() {
-	controlState.Lock()
-	defer controlState.Unlock()
-	controlState.tracker.Reset()
-	controlState.snapshot.State, controlState.snapshot.Reason = "unknown", "data_unavailable"
-	controlState.snapshot.SampledAt = time.Time{}
-	if smcConn != nil {
-		statusLED.apply(smc.LEDSystem, false, smcConn.SetMagSafeLedState, smcConn.GetMagSafeLedState)
-	}
-}
-
-func observePowerConnection(connected bool) {
-	controlState.Lock()
-	changed := !controlState.connectionKnown || controlState.connected != connected
-	controlState.connectionKnown, controlState.connected = true, connected
-	controlState.Unlock()
-	if changed {
-		invalidateControlStatus()
-	}
+func (d *Daemon) suspendControlStatus(suspended bool) {
+	s := &d.control
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.suspended = suspended
+	s.reset()
 }

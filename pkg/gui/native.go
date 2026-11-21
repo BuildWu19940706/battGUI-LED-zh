@@ -1,8 +1,7 @@
 package gui
 
 /*
-#cgo CFLAGS: -mmacosx-version-min=13.0
-#cgo LDFLAGS: -mmacosx-version-min=13.0 -framework Cocoa -framework ServiceManagement -framework CoreFoundation
+#cgo LDFLAGS: -framework Cocoa -framework ServiceManagement -framework CoreFoundation
 #include <stdlib.h>
 #include "native.h"
 */
@@ -10,10 +9,9 @@ import "C"
 
 import (
 	"fmt"
+	"log/slog"
 	"runtime/cgo"
 	"unsafe"
-
-	"github.com/sirupsen/logrus"
 )
 
 type menuItem int
@@ -26,6 +24,7 @@ const (
 	itemUpgrade                      menuItem = C.BattItemUpgrade
 	itemInstall                      menuItem = C.BattItemInstall
 	itemState                        menuItem = C.BattItemState
+	itemNativeLimitNotice            menuItem = C.BattItemNativeLimitNotice
 	itemCurrentLimit                 menuItem = C.BattItemCurrentLimit
 	itemQuickLimits                  menuItem = C.BattItemQuickLimits
 	itemLimit50                      menuItem = C.BattItemLimit50
@@ -47,6 +46,7 @@ const (
 	itemDisableChargingPreSleep      menuItem = C.BattItemDisableChargingPreSleep
 	itemPreventSystemSleep           menuItem = C.BattItemPreventSystemSleep
 	itemPreventSleepOnAdapterDisable menuItem = C.BattItemPreventSleepOnAdapterDisable
+	itemNoDrain                      menuItem = C.BattItemNoDrain
 	itemForceDischarge               menuItem = C.BattItemForceDischarge
 	itemAutoCalibration              menuItem = C.BattItemAutoCalibration
 	itemCalibrationStatus            menuItem = C.BattItemCalibrationStatus
@@ -59,7 +59,6 @@ const (
 	itemDisableLimit                 menuItem = C.BattItemDisableLimit
 	itemQuit                         menuItem = C.BattItemQuit
 	itemChargeRange                  menuItem = C.BattItemChargeRange
-	itemLEDStatus                    menuItem = C.BattItemLEDStatus
 )
 
 const (
@@ -130,6 +129,7 @@ const (
 	confirmForceDischargeIndefinitely   confirmation = C.BattConfirmationForceDischargeIndefinitely
 	confirmStartCalibration             confirmation = C.BattConfirmationStartCalibration
 	confirmPreventSleepOnAdapterDisable confirmation = C.BattConfirmationPreventSleepOnAdapterDisable
+	confirmNoDrain                      confirmation = C.BattConfirmationNoDrain
 )
 
 type nativeMenu struct {
@@ -231,18 +231,18 @@ func showNotification(title, body string) {
 }
 
 func RegisterLoginItem() error {
-	logrus.Info("Registering application to start at login")
+	slog.Info("Registering application to start at login")
 	if bool(C.batt_register_login_item()) {
-		logrus.Info("Successfully registered as login item")
+		slog.Info("Successfully registered as login item")
 		return nil
 	}
 	return fmt.Errorf("failed to register application as login item")
 }
 
 func UnregisterLoginItem() error {
-	logrus.Info("Removing application from login items")
+	slog.Info("Removing application from login items")
 	if bool(C.batt_unregister_login_item()) {
-		logrus.Info("Successfully unregistered login item")
+		slog.Info("Successfully unregistered login item")
 		return nil
 	}
 	return fmt.Errorf("failed to unregister application as login item")
@@ -272,7 +272,7 @@ func controllerForHandle(handle C.uintptr_t) *menuController {
 
 func recoverNativeCallback(name string) {
 	if recovered := recover(); recovered != nil {
-		logrus.Errorf("panic in %s: %v", name, recovered)
+		slog.Error(fmt.Sprintf("panic in %s: %v", name, recovered))
 	}
 }
 

@@ -2,9 +2,9 @@
 
 #include <ctype.h>
 #include <stdio.h>
-#include <stdlib.h>
-#include <stdbool.h>
 #include <pthread.h>
+#include <stdbool.h>
+#include <stdlib.h>
 
 #include <mach/mach_init.h>
 #include <mach/mach_interface.h>
@@ -23,30 +23,6 @@ IONotificationPortRef notifyPortRef;
 // notifier object, used to deregister later
 io_object_t notifierObject;
 long gMessageArgument;
-static CFRunLoopSourceRef powerSourceNotification;
-static CFRunLoopRef notificationRunLoop;
-static CFDictionaryRef previousAdapterDetails;
-static pthread_mutex_t powerSourceMutex = PTHREAD_MUTEX_INITIALIZER;
-static bool powerSourceStopped;
-
-static void powerSourceCallback(void *context) {
-    pthread_mutex_lock(&powerSourceMutex);
-    if (powerSourceStopped) { pthread_mutex_unlock(&powerSourceMutex); return; }
-    CFTypeRef info = IOPSCopyPowerSourcesInfo();
-    if (info == NULL) { pthread_mutex_unlock(&powerSourceMutex); return; }
-    CFStringRef source = IOPSGetProvidingPowerSourceType(info);
-    if (source != NULL) powerSourceChangedCallback(CFEqual(source, CFSTR(kIOPSACPowerValue)) ? 1 : 0);
-    // Switching between MagSafe and USB-C can keep the Mac on AC power.
-    // Treat an adapter-identity/negotiation change as a fresh connection too.
-    CFDictionaryRef adapter = IOPSCopyExternalPowerAdapterDetails();
-    Boolean changed = (adapter == NULL) != (previousAdapterDetails == NULL);
-    if (adapter != NULL && previousAdapterDetails != NULL && !CFEqual(adapter, previousAdapterDetails)) changed = true;
-    if (changed) powerAdapterChangedCallback();
-    if (previousAdapterDetails != NULL) CFRelease(previousAdapterDetails);
-    previousAdapterDetails = adapter;
-    CFRelease(info);
-    pthread_mutex_unlock(&powerSourceMutex);
-}
 
 int AllowPowerChange()
 {
@@ -115,64 +91,103 @@ void sleepCallBack(void* refCon, io_service_t service, natural_t messageType, vo
     }
 }
 
+// Only the listener thread accesses the previous power-source snapshot.
+typedef struct {
+    int onAC;
+    CFDictionaryRef adapter;
+} PowerConnection;
+
+static void powerSourceCallback(void *context)
+{
+    PowerConnection *previous = context;
+    CFTypeRef info = IOPSCopyPowerSourcesInfo();
+    if (info == NULL) return;
+    CFStringRef source = IOPSGetProvidingPowerSourceType(info);
+    if (source != NULL) {
+        int onAC = CFEqual(source, CFSTR(kIOPSACPowerValue));
+        CFDictionaryRef adapter = IOPSCopyExternalPowerAdapterDetails();
+        // Replacing MagSafe with USB-C can leave the Mac on AC throughout.
+        if (onAC != previous->onAC || (adapter == NULL) != (previous->adapter == NULL) ||
+            (adapter != NULL && !CFEqual(adapter, previous->adapter))) {
+            powerConnectionChangedCallback();
+        }
+        if (previous->adapter != NULL) CFRelease(previous->adapter);
+        previous->adapter = adapter;
+        previous->onAC = onAC;
+    }
+    CFRelease(info);
+}
+
+// Stop can arrive before the listener starts its run loop. Signal a run-loop
+// source so that either ordering executes the stop on the listener thread.
+static pthread_mutex_t listenerMutex = PTHREAD_MUTEX_INITIALIZER;
+static CFRunLoopRef listenerLoop;
+static CFRunLoopSourceRef stopSource;
+static bool stopRequested;
+
+static void stopCallback(void *context)
+{
+    CFRunLoopStop(CFRunLoopGetCurrent());
+}
+
 int ListenNotifications()
 {
-    // this parameter is passed to the callback
-    void* refCon = NULL;
-
-    // register to receive system sleep notifications
-    root_port = IORegisterForSystemPower(refCon, &notifyPortRef, sleepCallBack, &notifierObject);
+    root_port = IORegisterForSystemPower(NULL, &notifyPortRef, sleepCallBack, &notifierObject);
     if (root_port == 0) {
         printf("IORegisterForSystemPower failed\n");
         return 1;
     }
 
-    // add the notification port to the application runloop
-    CFRunLoopAddSource(CFRunLoopGetCurrent(),
-        IONotificationPortGetRunLoopSource(notifyPortRef), kCFRunLoopCommonModes);
-    notificationRunLoop = CFRunLoopGetCurrent();
-    CFRetain(notificationRunLoop);
-    powerSourceStopped = false;
-    powerSourceNotification = IOPSNotificationCreateRunLoopSource(powerSourceCallback, NULL);
-    if (powerSourceNotification != NULL) CFRunLoopAddSource(notificationRunLoop, powerSourceNotification, kCFRunLoopCommonModes);
-    powerSourceCallback(NULL);
+    CFRunLoopRef loop = CFRunLoopGetCurrent();
+    CFRunLoopSourceRef sleepSource = IONotificationPortGetRunLoopSource(notifyPortRef);
+    CFRunLoopAddSource(loop, sleepSource, kCFRunLoopCommonModes);
 
-    // Start the run loop to receive sleep notifications.
-    CFRunLoopRun();
+    PowerConnection previous = { .onAC = -1, .adapter = NULL };
+    CFRunLoopSourceRef powerSource = IOPSNotificationCreateRunLoopSource(powerSourceCallback, &previous);
+    if (powerSource != NULL) {
+        CFRunLoopAddSource(loop, powerSource, kCFRunLoopCommonModes);
+        powerSourceCallback(&previous);
+    }
 
-    // Not reached, CFRunLoopRun doesn't return in this case.
-    return 0;
+    CFRunLoopSourceContext context = { .perform = stopCallback };
+    CFRunLoopSourceRef stop = CFRunLoopSourceCreate(NULL, 0, &context);
+    if (stop != NULL) {
+        CFRunLoopAddSource(loop, stop, kCFRunLoopCommonModes);
+        pthread_mutex_lock(&listenerMutex);
+        listenerLoop = loop;
+        stopSource = stop;
+        if (stopRequested) CFRunLoopSourceSignal(stop);
+        pthread_mutex_unlock(&listenerMutex);
+        CFRunLoopRun();
+        pthread_mutex_lock(&listenerMutex);
+        listenerLoop = NULL;
+        stopSource = NULL;
+        stopRequested = false;
+        pthread_mutex_unlock(&listenerMutex);
+        CFRunLoopRemoveSource(loop, stop, kCFRunLoopCommonModes);
+        CFRelease(stop);
+    }
+
+    if (powerSource != NULL) {
+        CFRunLoopRemoveSource(loop, powerSource, kCFRunLoopCommonModes);
+        CFRelease(powerSource);
+    }
+    if (previous.adapter != NULL) CFRelease(previous.adapter);
+    CFRunLoopRemoveSource(loop, sleepSource, kCFRunLoopCommonModes);
+    IODeregisterForSystemPower(&notifierObject);
+    IOServiceClose(root_port);
+    IONotificationPortDestroy(notifyPortRef);
+    return stop == NULL;
 }
 
 int StopListeningNotifications()
 {
-    // remove the sleep notification port from the application runloop
-    if (notificationRunLoop == NULL) return 0;
-    pthread_mutex_lock(&powerSourceMutex);
-    powerSourceStopped = true;
-    if (powerSourceNotification != NULL) {
-        CFRunLoopRemoveSource(notificationRunLoop, powerSourceNotification, kCFRunLoopCommonModes);
-        CFRelease(powerSourceNotification);
-        powerSourceNotification = NULL;
+    pthread_mutex_lock(&listenerMutex);
+    stopRequested = true;
+    if (stopSource != NULL) {
+        CFRunLoopSourceSignal(stopSource);
+        CFRunLoopWakeUp(listenerLoop);
     }
-    CFRunLoopRemoveSource(notificationRunLoop,
-       IONotificationPortGetRunLoopSource(notifyPortRef),
-       kCFRunLoopCommonModes);
-
-    // deregister for system sleep notifications
-    IODeregisterForSystemPower(&notifierObject);
-
-    // IORegisterForSystemPower implicitly opens the Root Power Domain IOService
-    // so we close it here
-    IOServiceClose(root_port);
-
-    // destroy the notification port allocated by IORegisterForSystemPower
-    IONotificationPortDestroy(notifyPortRef);
-    if (previousAdapterDetails != NULL) { CFRelease(previousAdapterDetails); previousAdapterDetails = NULL; }
-    pthread_mutex_unlock(&powerSourceMutex);
-    CFRunLoopStop(notificationRunLoop);
-    CFRelease(notificationRunLoop);
-    notificationRunLoop = NULL;
-
+    pthread_mutex_unlock(&listenerMutex);
     return 0;
 }

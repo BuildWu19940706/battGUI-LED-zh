@@ -2,27 +2,10 @@ package gui
 
 import (
 	"fmt"
-	"github.com/charlie0129/batt/pkg/compatibility"
+
+	"github.com/charlie0129/batt/pkg/config"
 	"github.com/charlie0129/batt/pkg/powerinfo"
 )
-
-func magSafeEnableTitle(mode compatibility.ChargeControlMode) string {
-	if mode == compatibility.ChargeControlFirmware {
-		return tr("Enable (Firmware Mode)")
-	}
-	return tr("Enable")
-}
-
-func magSafeActionTitle(caps compatibility.Capabilities) string {
-	if caps.MagSafeLEDRetry {
-		return tr("Retry LED Control")
-	}
-	return magSafeEnableTitle(caps.ChargeControlMode)
-}
-
-func canShowMagSafeControls(installed bool, caps compatibility.Capabilities, needsUpgrade bool) bool {
-	return installed && caps.ChargingControl && !needsUpgrade && caps.Supports(compatibility.FeatureMagSafeLED)
-}
 
 func controlStatusTitle(status *powerinfo.ControlStatus) string {
 	if status == nil {
@@ -50,28 +33,20 @@ func controlStatusTitle(status *powerinfo.ControlStatus) string {
 	}
 }
 
-func ledStatusTitle(status powerinfo.LEDStatus) string {
-	message := "System controlled"
-	switch {
-	case status.Reason == "release_failed":
-		message = "LED release failed; system control could not be confirmed"
-	case status.Reason == "write_failed":
-		message = "Control failed; returned to system"
-	case status.Reason == "firmware_unverified":
-		message = "Firmware mode: physical LED control not yet verified"
-	case status.Reason == "no_interface":
-		message = "No usable LED interface"
-	case status.Available:
-		switch status.Mode {
-		case "enabled":
-			message = "Indicate charging status"
-		case "always-off":
-			message = "Always off"
+// magSafeModeTitle describes the configured upstream mode, not a sampled LED color.
+func magSafeModeTitle(available bool, mode config.ControlMagSafeMode) string {
+	label := "LED control unavailable"
+	if available {
+		switch mode {
+		case config.ControlMagSafeModeEnabled:
+			label = "Enable"
+		case config.ControlMagSafeModeAlwaysOff:
+			label = "Always-off"
+		default:
+			label = "Disable"
 		}
-	default:
-		message = "LED control unavailable"
 	}
-	return fmt.Sprintf(tr("MagSafe: %s"), tr(message))
+	return fmt.Sprintf(tr("MagSafe: %s"), tr(label))
 }
 
 func validChargeRange(upper, lower int) bool {
@@ -84,21 +59,13 @@ func (c *menuController) editChargeRange() {
 		showAlert("Failed to get config", err.Error())
 		return
 	}
-	upper, lower := c.upperLimit, 0
-	if raw.Limit != nil {
-		upper = *raw.Limit
-	}
-	delta := 2
-	if raw.LowerLimitDelta != nil {
-		delta = *raw.LowerLimitDelta
-	}
-	lower = upper - delta
-	status, led := tr("State: Unknown"), tr("LED control unavailable")
-	if telemetry, err := c.api.GetTelemetry(false, false); err == nil && telemetry.Control != nil {
+	conf := config.NewFileFromConfig(raw, "")
+	status := tr("State: Unknown")
+	if telemetry, err := c.api.GetTelemetry(false, false); err == nil && telemetry != nil && telemetry.Control != nil {
 		status = controlStatusTitle(telemetry.Control)
-		led = ledStatusTitle(telemetry.Control.LED)
 	}
-	upper, lower, ok := showChargeRange(upper, lower, status, led)
+	led := magSafeModeTitle(c.capabilities.MagSafeLED, conf.ControlMagSafeLED())
+	upper, lower, ok := showChargeRange(conf.UpperLimit(), conf.LowerLimit(), status, led)
 	if !ok {
 		return
 	}

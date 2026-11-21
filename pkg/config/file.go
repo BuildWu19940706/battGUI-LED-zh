@@ -2,7 +2,9 @@ package config
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,7 +12,6 @@ import (
 	"time"
 
 	pkgerrors "github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 
 	"github.com/charlie0129/batt/pkg/utils/ptr"
 )
@@ -38,6 +39,7 @@ var (
 		PreventSystemSleep:           ptr.To(false),
 		AllowNonRootAccess:           ptr.To(false),
 		AdapterMode:                  ptr.To(false),
+		NoDrain:                      ptr.To(false),
 		LowerLimitDelta:              ptr.To(2),
 
 		CalibrationDischargeThreshold:  ptr.To(15),
@@ -96,7 +98,7 @@ func (c *ControlMagSafeMode) UnmarshalJSON(data []byte) error {
 		case ctrlMagSafeModeAlwaysOffStr:
 			*c = ControlMagSafeModeAlwaysOff
 		default:
-			logrus.Warnf("invalid ControlMagSafeMode %q, falling back to %q", s, ControlMagSafeModeDisabled)
+			slog.Warn(fmt.Sprintf("invalid ControlMagSafeMode %q, falling back to %q", s, ControlMagSafeModeDisabled))
 			*c = ControlMagSafeModeDisabled
 		}
 		return nil
@@ -120,6 +122,7 @@ type RawFileConfig struct {
 	PreventSystemSleep      *bool               `json:"preventSystemSleep,omitempty"`
 	AllowNonRootAccess      *bool               `json:"allowNonRootAccess,omitempty"`
 	AdapterMode             *bool               `json:"adapterMode,omitempty"`
+	NoDrain                 *bool               `json:"noDrain,omitempty"`
 	LowerLimitDelta         *int                `json:"lowerLimitDelta,omitempty"`
 	ControlMagSafeLED       *ControlMagSafeMode `json:"controlMagSafeLED,omitempty"`
 
@@ -149,6 +152,7 @@ func NewRawFileConfigFromConfig(c Config) (*RawFileConfig, error) {
 		PreventSleepOnAdapterDisable: ptr.To(c.PreventSleepOnAdapterDisable()),
 		AllowNonRootAccess:           ptr.To(c.AllowNonRootAccess()),
 		AdapterMode:                  ptr.To(c.AdapterMode()),
+		NoDrain:                      ptr.To(c.NoDrain()),
 		LowerLimitDelta:              ptr.To(c.UpperLimit() - c.LowerLimit()),
 		ControlMagSafeLED:            ptr.To(c.ControlMagSafeLED()),
 		Cron:                         ptr.To(c.Cron()),
@@ -298,6 +302,18 @@ func (f *File) AdapterMode() bool {
 		return *f.c.AdapterMode
 	}
 	return *defaultFileConfig.AdapterMode
+}
+
+func (f *File) NoDrain() bool {
+	if f.c == nil {
+		panic("config is nil")
+	}
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if f.c.NoDrain != nil {
+		return *f.c.NoDrain
+	}
+	return *defaultFileConfig.NoDrain
 }
 
 func (f *File) ControlMagSafeLED() ControlMagSafeMode {
@@ -478,6 +494,15 @@ func (f *File) SetAdapterMode(b bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.c.AdapterMode = &b
+}
+
+func (f *File) SetNoDrain(b bool) {
+	if f.c == nil {
+		panic("config is nil")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.c.NoDrain = &b
 }
 
 func (f *File) SetControlMagSafeLED(mode ControlMagSafeMode) {
@@ -715,7 +740,7 @@ func (f *File) Load() error {
 	defer func(fp *os.File) {
 		err := fp.Close()
 		if err != nil {
-			logrus.Warnf("failed to close file %s", f.filepath)
+			slog.Warn(fmt.Sprintf("failed to close file %s", f.filepath))
 		}
 	}(fp)
 
@@ -788,19 +813,20 @@ func (f *File) Save() error {
 	return os.Rename(fp.Name(), target)
 }
 
-func (f *File) LogrusFields() logrus.Fields {
+func (f *File) LogValue() slog.Value {
 	if f.c == nil {
 		panic("config is nil")
 	}
 
-	return logrus.Fields{
-		"upperLimit":                   f.UpperLimit(),
-		"lowerLimit":                   f.LowerLimit(),
-		"preventIdleSleep":             f.PreventIdleSleep(),
-		"disableChargingPreSleep":      f.DisableChargingPreSleep(),
-		"preventSystemSleep":           f.PreventSystemSleep(),
-		"preventSleepOnAdapterDisable": f.PreventSleepOnAdapterDisable(),
-		"allowNonRootAccess":           f.AllowNonRootAccess(),
-		"controlMagsafeLed":            f.ControlMagSafeLED(),
-	}
+	return slog.GroupValue(
+		slog.Int("upperLimit", f.UpperLimit()),
+		slog.Int("lowerLimit", f.LowerLimit()),
+		slog.Bool("preventIdleSleep", f.PreventIdleSleep()),
+		slog.Bool("disableChargingPreSleep", f.DisableChargingPreSleep()),
+		slog.Bool("preventSystemSleep", f.PreventSystemSleep()),
+		slog.Bool("preventSleepOnAdapterDisable", f.PreventSleepOnAdapterDisable()),
+		slog.Bool("allowNonRootAccess", f.AllowNonRootAccess()),
+		slog.String("controlMagsafeLed", string(f.ControlMagSafeLED())),
+		slog.Bool("noDrain", f.NoDrain()),
+	)
 }

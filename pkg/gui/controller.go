@@ -3,10 +3,9 @@ package gui
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"time"
-
-	"github.com/sirupsen/logrus"
 
 	"github.com/charlie0129/batt/pkg/calibration"
 	"github.com/charlie0129/batt/pkg/client"
@@ -46,70 +45,71 @@ func (c *menuController) onTimerTick() {
 }
 
 func (c *menuController) refreshCompatibility() {
-	logrus.Info("Getting config")
+	slog.Info("Getting config")
 	rawConfig, err := c.api.GetConfig()
 	if err != nil {
-		logrus.WithError(err).Warn(tr("Failed to get config"))
+		slog.Warn("Failed to get config", "error", err)
 		c.setCompatibility(false, compatibility.Permissive(), false)
 		return
 	}
 	conf := config.NewFileFromConfig(rawConfig, "")
-	logrus.WithFields(conf.LogrusFields()).Info("Got config")
+	slog.Info("Got config", "config", conf)
 	c.menu.setChecked(itemPreventSleepOnAdapterDisable, conf.PreventSleepOnAdapterDisable())
+	c.menu.setChecked(itemNoDrain, conf.NoDrain())
 
-	logrus.Info("Getting hardware compatibility")
+	slog.Info("Getting hardware compatibility")
 	capabilities, err := c.api.GetCompatibility()
 	c.compatibilityKnown = err == nil
 	if err != nil {
-		logrus.WithError(err).Warn("Detailed compatibility unavailable; enabling all GUI features")
+		slog.Warn("Detailed compatibility unavailable; enabling all GUI features", "error", err)
 		fallback := compatibility.Permissive()
 		capabilities = &fallback
 	}
-	logrus.WithField("capabilities", capabilities).Info("Got hardware compatibility")
+	slog.Info("Got hardware compatibility", "capabilities", capabilities)
 
-	logrus.Info("Getting daemon version")
+	slog.Info("Getting daemon version")
 	daemonVersion, err := c.api.GetVersion()
 	if err != nil {
-		logrus.WithError(err).Warn(tr("Failed to get version"))
+		slog.Warn("Failed to get version", "error", err)
 		c.setCompatibility(true, *capabilities, true)
 	} else {
 		c.setCompatibility(true, *capabilities, daemonVersion != version.Version)
 	}
-	logrus.WithFields(logrus.Fields{
-		"daemonVersion": daemonVersion,
-		"clientVersion": version.Version,
-	}).Info("Got daemon")
+	slog.Info("Got daemon",
+		"daemonVersion", daemonVersion,
+		"clientVersion", version.Version,
+	)
 }
 
 func (c *menuController) refreshOnOpen() {
 	rawConfig, err := c.api.GetConfig()
 	if err != nil {
-		logrus.WithError(err).Error(tr("Failed to get config"))
+		slog.Error("Failed to get config", "error", err)
 		c.setCompatibility(false, compatibility.Permissive(), false)
 		return
 	}
 	conf := config.NewFileFromConfig(rawConfig, "")
-	logrus.WithFields(conf.LogrusFields()).Info("Got config")
+	slog.Info("Got config", "config", conf)
 	c.updateDisableSchedules(conf)
 
 	capabilities, err := c.api.GetCompatibility()
 	c.compatibilityKnown = err == nil
 	if err != nil {
-		logrus.WithError(err).Warn("Detailed compatibility unavailable; enabling all GUI features")
+		slog.Warn("Detailed compatibility unavailable; enabling all GUI features", "error", err)
 		fallback := compatibility.Permissive()
 		capabilities = &fallback
 	}
 	daemonVersion, err := c.api.GetVersion()
 	if err != nil {
-		logrus.WithError(err).Error(tr("Failed to get version"))
+		slog.Error("Failed to get version", "error", err)
 		c.setCompatibility(true, *capabilities, true)
 	} else {
 		c.setCompatibility(true, *capabilities, daemonVersion != version.Version)
 	}
-	logrus.WithFields(logrus.Fields{
-		"daemonVersion": daemonVersion,
-		"clientVersion": version.Version,
-	}).Info("Got daemon")
+	slog.Info("Got daemon",
+		"daemonVersion", daemonVersion,
+		"clientVersion", version.Version,
+	)
 
 	isPluggedIn, err := c.api.GetPluggedIn()
 	if err != nil {
@@ -137,6 +137,7 @@ func (c *menuController) refreshOnOpen() {
 
 	c.calibrationThreshold = conf.CalibrationDischargeThreshold()
 	c.updateChargeOnce(conf, currentCharge)
+	c.updateNativeLimitNotice(batteryInfo)
 	c.menu.setTitle(itemCurrentLimit, fmt.Sprintf(tr("Current Limit: %d%%"), conf.UpperLimit()))
 	for _, item := range quickLimitItems {
 		c.menu.setChecked(item, quickLimitForItem(item) == conf.UpperLimit())
@@ -163,11 +164,12 @@ func (c *menuController) refreshOnOpen() {
 	c.menu.setChecked(itemDisableChargingPreSleep, conf.DisableChargingPreSleep())
 	c.menu.setChecked(itemPreventSystemSleep, conf.PreventSystemSleep())
 	c.menu.setChecked(itemPreventSleepOnAdapterDisable, conf.PreventSleepOnAdapterDisable())
+	c.menu.setChecked(itemNoDrain, conf.NoDrain())
 	if capabilities.AdapterControl {
 		if adapter, err := c.api.GetAdapter(); err == nil {
 			c.updateAdapterState(adapter)
 		} else {
-			logrus.WithError(err).Error(tr("Failed to get adapter"))
+			slog.Error("Failed to get adapter", "error", err)
 			c.adapterKnown = false
 			if c.compatibilityKnown {
 				c.menu.setEnabled(itemForceDischarge, false)
@@ -180,19 +182,30 @@ func (c *menuController) refreshOnOpen() {
 func (c *menuController) refreshDisableSchedules() {
 	rawConfig, err := c.api.GetConfig()
 	if err != nil {
-		logrus.WithError(err).Debug("Failed to refresh temporary disable schedule")
+		slog.Debug("Failed to refresh temporary disable schedule", "error", err)
 		return
 	}
 	conf := config.NewFileFromConfig(rawConfig, "")
 	c.updateDisableSchedules(conf)
 	c.menu.setChecked(itemPreventSleepOnAdapterDisable, conf.PreventSleepOnAdapterDisable())
+	c.menu.setChecked(itemNoDrain, conf.NoDrain())
 
 	currentCharge, err := c.api.GetCurrentCharge()
 	if err != nil {
-		logrus.WithError(err).Debug("Failed to refresh current charge")
+		slog.Debug("Failed to refresh current charge", "error", err)
 		currentCharge = c.currentCharge
 	}
 	c.updateChargeOnce(conf, currentCharge)
+	if c.capabilities.ChargeControlMode == compatibility.ChargeControlNative {
+		if batteryInfo, err := c.api.GetBatteryInfo(); err == nil {
+			c.updateNativeLimitNotice(batteryInfo)
+		} else {
+			c.menu.setHidden(itemNativeLimitNotice, true)
+			slog.Debug("Failed to refresh native limit state", "error", err)
+		}
+	} else {
+		c.menu.setHidden(itemNativeLimitNotice, true)
+	}
 
 	if c.capabilities.AdapterControl {
 		if adapter, err := c.api.GetAdapter(); err == nil {
@@ -301,8 +314,36 @@ func (c *menuController) updateForceDischargeControls() {
 }
 
 func (c *menuController) setStateError(message string, err error) {
-	logrus.WithError(err).Error(message)
-	c.menu.setTitle(itemState, tr("State: Error"))
+	slog.Error(message, "error", err)
+	c.menu.setTitle(itemState, "State: Error")
+	c.menu.setHidden(itemNativeLimitNotice, true)
+}
+
+func (c *menuController) updateNativeLimitNotice(batteryInfo *powerinfo.Battery) {
+	title, tooltip, visible := nativeLimitNotice(c.capabilities.ChargeControlMode, c.upperLimit, c.currentCharge, batteryInfo)
+	c.menu.setHidden(itemNativeLimitNotice, !visible)
+	if visible {
+		c.menu.setTitle(itemNativeLimitNotice, title)
+		c.menu.setTooltip(itemNativeLimitNotice, tooltip)
+	}
+}
+
+// nativeLimitNotice explains why macOS is not enforcing the configured native
+// limit right now, if it is not.
+func nativeLimitNotice(mode compatibility.ChargeControlMode, upperLimit, currentCharge int, batteryInfo *powerinfo.Battery) (title, tooltip string, visible bool) {
+	if mode != compatibility.ChargeControlNative || upperLimit >= 100 {
+		return "", "", false
+	}
+	switch {
+	case batteryInfo.FullChargeOverrideAtFull(currentCharge):
+		return "Battery full; waiting for macOS", powerinfo.FullChargeOverrideAtFullNotice, true
+	case batteryInfo.FullChargeOverrideActive():
+		return "Limit paused by macOS", fullChargeOverrideTooltip, true
+	case batteryInfo.ChargeLimitPendingActive():
+		return "Waiting for macOS to apply limit", powerinfo.ChargeLimitPendingNotice, true
+	default:
+		return "", "", false
+	}
 }
 
 func canShowPreventSleepOnAdapterDisable(installed bool, capabilities compatibility.Capabilities, needsUpgrade bool) bool {
@@ -314,17 +355,17 @@ func (c *menuController) setCompatibility(installed bool, capabilities compatibi
 		return
 	}
 	c.capabilities = capabilities
+	c.menu.setHidden(itemNativeLimitNotice, true)
 	c.menu.setStatusIcon(installed, capabilities.ChargingControl, needsUpgrade)
 
 	usable := installed && capabilities.ChargingControl && !needsUpgrade
 	c.rangeEditable = usable && capabilities.ChargeRange
-	c.menu.setHidden(itemChargeRange, !installed || !capabilities.ChargingControl)
+	c.menu.setHidden(itemChargeRange, !installed || !capabilities.ChargingControl || capabilities.ChargeControlMode == compatibility.ChargeControlNative)
 	c.menu.setEnabled(itemChargeRange, c.rangeEditable)
 	c.menu.setTooltip(itemChargeRange, tr("Upgrade the daemon to edit both limits together."))
 	if c.rangeEditable {
 		c.menu.setTooltip(itemChargeRange, tr("Charging pauses at the upper limit and resumes below the lower limit."))
 	}
-	c.menu.setHidden(itemLEDStatus, !installed || !capabilities.ChargingControl)
 	c.menu.setHidden(itemPowerFlow, !usable)
 	c.menu.setHidden(itemInstall, installed)
 	c.menu.setHidden(itemUpgrade, !installed || (!needsUpgrade && capabilities.ChargingControl))
@@ -345,18 +386,12 @@ func (c *menuController) setCompatibility(installed bool, capabilities compatibi
 	}
 
 	c.menu.setHidden(itemAdvanced, !installed)
-	c.menu.setHidden(itemMagSafe, !canShowMagSafeControls(installed, capabilities, needsUpgrade))
-	c.menu.setTitle(itemMagSafeEnabled, magSafeActionTitle(capabilities))
-	c.menu.setTooltip(itemMagSafe, "")
-	if capabilities.MagSafeLEDRetry {
-		c.menu.setTooltip(itemMagSafe, tr("Retry first restores system control, then starts a new LED session. If recovery fails, control stays disabled."))
-	} else if capabilities.MagSafeLED && capabilities.ChargeControlMode == compatibility.ChargeControlFirmware {
-		c.menu.setTooltip(itemMagSafe, tr("This platform passed administrator LED write/readback and visible-color checks. Firmware charge limits remain unchanged. Long-term sleep and reconnect behavior still needs observation; failures return control to the system."))
-	}
+	c.menu.setHidden(itemMagSafe, !usable || !capabilities.MagSafeLED)
 	c.menu.setHidden(itemPreventIdleSleep, !usable || !capabilities.SleepHooks)
 	c.menu.setHidden(itemDisableChargingPreSleep, !usable || !capabilities.SleepHooks)
 	c.menu.setHidden(itemPreventSystemSleep, !usable || !capabilities.SleepHooks)
 	c.menu.setHidden(itemPreventSleepOnAdapterDisable, !canShowPreventSleepOnAdapterDisable(installed, capabilities, needsUpgrade))
+	c.menu.setHidden(itemNoDrain, !usable || capabilities.ChargeControlMode != compatibility.ChargeControlNative || !capabilities.NativeExactTargets)
 	c.menu.setHidden(itemForceDischarge, !usable || !capabilities.AdapterControl)
 	c.menu.setHidden(itemAutoCalibration, !usable || !capabilities.Calibration)
 	c.menu.setHidden(itemUninstall, !installed)
@@ -372,21 +407,16 @@ func (c *menuController) updateTelemetry() {
 	telemetry, err := c.api.GetTelemetry(true, true)
 	if err != nil || telemetry == nil {
 		c.menu.setControlState("unknown", tr("State: Unknown"))
-		c.menu.setTitle(itemLEDStatus, tr("LED control unavailable"))
 		if err != nil {
-			logrus.WithError(err).Debug("GetTelemetry failed")
+			slog.Debug("GetTelemetry failed", "error", err)
 		}
 		return
 	}
 	if telemetry.Control != nil {
-		// Compatibility controls access to settings, including manual recovery.
-		// A failed telemetry sample must not hide the recovery action again.
 		c.menu.setTitle(itemState, controlStatusTitle(telemetry.Control))
-		c.menu.setTitle(itemLEDStatus, ledStatusTitle(telemetry.Control.LED))
 		c.menu.setControlState(telemetry.Control.State, controlStatusTitle(telemetry.Control))
 	} else {
 		c.menu.setControlState("unknown", "batt")
-		c.menu.setTitle(itemLEDStatus, ledStatusTitle(powerinfo.LEDStatus{Available: c.capabilities.MagSafeLED, Reason: c.capabilities.MagSafeLEDReason}))
 	}
 	if telemetry.Power != nil {
 		calculations := telemetry.Power.Calculations
@@ -541,8 +571,7 @@ func (c *menuController) calibrationStatusTitle(status *calibration.Status) (str
 }
 
 func (c *menuController) updateMagSafeChecks(mode config.ControlMagSafeMode) {
-	active := !c.capabilities.MagSafeLEDRetry
-	c.menu.setChecked(itemMagSafeEnabled, active && mode == config.ControlMagSafeModeEnabled)
-	c.menu.setChecked(itemMagSafeAlwaysOff, active && mode == config.ControlMagSafeModeAlwaysOff)
-	c.menu.setChecked(itemMagSafeDisabled, active && mode != config.ControlMagSafeModeEnabled && mode != config.ControlMagSafeModeAlwaysOff)
+	c.menu.setChecked(itemMagSafeEnabled, mode == config.ControlMagSafeModeEnabled)
+	c.menu.setChecked(itemMagSafeAlwaysOff, mode == config.ControlMagSafeModeAlwaysOff)
+	c.menu.setChecked(itemMagSafeDisabled, mode != config.ControlMagSafeModeEnabled && mode != config.ControlMagSafeModeAlwaysOff)
 }

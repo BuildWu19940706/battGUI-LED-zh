@@ -2,7 +2,8 @@ package smc
 
 import (
 	"fmt"
-	"github.com/sirupsen/logrus"
+
+	"github.com/charlie0129/batt/pkg/logging"
 )
 
 // MagSafeLedState is the state of the MagSafe LED.
@@ -22,40 +23,35 @@ const (
 
 // SetMagSafeLedState .
 func (c *AppleSMC) SetMagSafeLedState(state MagSafeLedState) error {
-	logrus.Tracef("SetMagSafeLedState(%v) called", state)
+	logging.Trace(fmt.Sprintf("SetMagSafeLedState(%v) called", state))
 
 	return c.Write(MagSafeLedKey, []byte{byte(state)})
 }
 
 func (c *AppleSMC) DisableMagSafeLed() error {
-	logrus.Tracef("DisableMagSafeLed() called")
+	logging.Trace("DisableMagSafeLed() called")
 
 	return c.Write(MagSafeLedKey, []byte{byte(LEDOff)})
 }
 
 // GetMagSafeLedState .
 func (c *AppleSMC) GetMagSafeLedState() (MagSafeLedState, error) {
-	logrus.Tracef("GetMagSafeLedState called")
+	logging.Trace("GetMagSafeLedState called")
 
 	v, err := c.Read(MagSafeLedKey)
-	if err != nil {
-		return LEDSystem, err
-	}
-	if len(v.Bytes) != 1 {
-		return LEDSystem, fmt.Errorf("invalid MagSafe LED data length: %d", len(v.Bytes))
+	if err != nil || len(v.Bytes) != 1 {
+		return LEDOrange, err
 	}
 
 	rawState := MagSafeLedState(v.Bytes[0])
 	ret := LEDOrange
 	switch rawState {
-	case LEDSystem, LEDOff, LEDGreen, LEDOrange, LEDErrorOnce, LEDErrorPermSlow, LEDErrorPermFast, LEDErrorPermOff:
+	case LEDOff, LEDGreen, LEDOrange, LEDErrorOnce, LEDErrorPermSlow:
 		ret = rawState
 	case 2:
 		ret = LEDGreen
-	default:
-		return LEDSystem, fmt.Errorf("unknown MagSafe LED state: 0x%02x", v.Bytes[0])
 	}
-	logrus.Tracef("GetMagSafeLedState returned %v", ret)
+	logging.Trace(fmt.Sprintf("GetMagSafeLedState returned %v", ret))
 	return ret, nil
 }
 

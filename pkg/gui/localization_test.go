@@ -2,11 +2,13 @@ package gui
 
 import (
 	"fmt"
-	"github.com/charlie0129/batt/pkg/powerinfo"
 	"regexp"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/charlie0129/batt/pkg/config"
+	"github.com/charlie0129/batt/pkg/powerinfo"
 )
 
 func TestPreferredLanguageSelection(t *testing.T) {
@@ -30,7 +32,7 @@ func TestChineseDynamicGUI(t *testing.T) {
 	if got := controlStatusTitle(&powerinfo.ControlStatus{State: "reached", TargetPercent: 80, ChargePercent: 80}); !strings.Contains(got, "已达上限") {
 		t.Fatal(got)
 	}
-	if got := ledStatusTitle(powerinfo.LEDStatus{Reason: "firmware_unverified"}); !strings.Contains(got, "尚未验证") {
+	if got := magSafeModeTitle(true, config.ControlMagSafeModeAlwaysOff); got != "MagSafe：始终关闭" {
 		t.Fatal(got)
 	}
 }
@@ -46,7 +48,7 @@ func TestTranslationFormatAndCoverage(t *testing.T) {
 			t.Errorf("format mismatch %q: %v vs %v", key, a, b)
 		}
 	}
-	for _, key := range []string{"Quick Limits", "Quit Menubar App", "Charge Range...", "Charging", "Cancel", "Save", "MagSafe: %s", "Upper limit (%)", "Lower limit (%)"} {
+	for _, key := range []string{"Quick Limits", "Quit Menubar App", "Charge Range...", "Charging", "Cancel", "Save", "No-drain Above Native Limit (Experimental)", "Waiting for macOS to apply limit", powerinfo.ChargeLimitPendingNotice, "Enable No-drain?", "MagSafe: %s", "Upper limit (%)", "Lower limit (%)"} {
 		if chineseMessages[key] == "" {
 			t.Errorf("missing UI translation %q", key)
 		}

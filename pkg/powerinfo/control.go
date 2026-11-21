@@ -11,22 +11,13 @@ type ControlStatus struct {
 	State         string    `json:"state"`
 	Reason        string    `json:"reason"`
 	SampledAt     time.Time `json:"sampledAt"`
-	LED           LEDStatus `json:"led"`
-}
-
-type LEDStatus struct {
-	InterfacePresent bool   `json:"interfacePresent"`
-	Available        bool   `json:"available"`
-	Reason           string `json:"reason,omitempty"`
-	Mode             string `json:"mode"`
-	Desired          string `json:"desired"`
 }
 
 type ControlInput struct {
-	Valid, PluggedIn, Charging, Full, Discharging bool
-	ForcedDischarge, Calibrating, Suspended       bool
-	Charge, Target, Lower, ConfiguredUpper        int
-	Now                                           time.Time
+	Valid, PluggedIn, Charging, Full, Discharging        bool
+	ForcedDischarge, Calibrating, Suspended, NativeLimit bool
+	Charge, Target, Lower, ConfiguredUpper               int
+	Now                                                  time.Time
 }
 
 // ControlTracker only keeps evidence from the current uninterrupted session.
@@ -61,6 +52,9 @@ func (t *ControlTracker) Update(in ControlInput) ControlStatus {
 	case in.Charging:
 		t.reached = false
 		out.State, out.Reason = "charging", "charging_to_target"
+	case in.NativeLimit && in.Discharging:
+		t.reached = false
+		out.State, out.Reason = "discharging", "battery_supplementing"
 	case in.Charge >= in.Target && (in.Target < 100 || in.Full):
 		t.reached = true
 		out.State, out.Reason = "reached", "target_reached"

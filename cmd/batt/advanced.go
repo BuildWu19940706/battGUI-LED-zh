@@ -2,10 +2,10 @@ package main
 
 import (
 	"fmt"
+	"log/slog"
 
 	"github.com/charlie0129/batt/pkg/compatibility"
 	"github.com/charlie0129/batt/pkg/config"
-	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )
 
@@ -34,6 +34,20 @@ func NewAdapterModeCommand() *cobra.Command {
 When the SMC charge-control keys are gated (macOS 27 firmware), batt can hold the limit by cutting wall power, running on battery between the lower and upper limits. It is opt-in for that reason and takes effect immediately.`,
 		func() (string, error) { return apiClient.SetAdapterMode(true) },
 		func() (string, error) { return apiClient.SetAdapterMode(false) },
+	)
+}
+
+func NewNoDrainCommand() *cobra.Command {
+	return newEnableDisableCommand(
+		"no-drain",
+		"Keep wall power above the native charge limit (macOS 27, experimental)",
+		`Keep the battery from draining while it is above the native charge limit on macOS 27.
+
+This is opt-in and experimental. batt writes powerd's no-drain charge policy and must restart powerd when the policy changes. A powerd restart drops sleep assertions owned by other applications, including caffeinate. batt defers each restart until those assertions are gone and uses the regular native limit meanwhile. The setting is not available in adapter or firmware-managed modes.
+
+macOS may still charge to 100% for battery maintenance. While no-drain is enabled, batt does not provide a lower-limit hysteresis band.`,
+		func() (string, error) { return apiClient.SetNoDrain(true) },
+		func() (string, error) { return apiClient.SetNoDrain(false) },
 	)
 }
 
@@ -93,18 +107,18 @@ func NewSetControlMagSafeLEDCommand() *cobra.Command {
 	enable := &cobra.Command{
 		Use: "enable",
 		Short: `Enable MagSafe LED control. The LED will reflect charging status:
-		- Green: Charge limit is reached and charging is stopped.
+		- Green: Charging is stopped.
 		- Orange: Charging is in progress.
-		- Off: Woke from sleep, charging is off and batt is awaiting control.`,
+		- Off: Forced off, or temporarily after wake with active charging control.`,
 		RunE: func(_ *cobra.Command, _ []string) error {
 			ret, err := apiClient.SetControlMagSafeLED(config.ControlMagSafeModeEnabled)
 			if err != nil {
 				return fmt.Errorf("failed to set to %s: %v", use, err)
 			}
 			if ret != "" {
-				logrus.Infof("daemon responded: %s", ret)
+				slog.Info(fmt.Sprintf("daemon responded: %s", ret))
 			}
-			logrus.Infof("successfully set to %s", use)
+			slog.Info(fmt.Sprintf("successfully set to %s", use))
 			return nil
 		},
 	}
@@ -118,9 +132,9 @@ func NewSetControlMagSafeLEDCommand() *cobra.Command {
 				return fmt.Errorf("failed to set to %s: %v", use, err)
 			}
 			if ret != "" {
-				logrus.Infof("daemon responded: %s", ret)
+				slog.Info(fmt.Sprintf("daemon responded: %s", ret))
 			}
-			logrus.Infof("successfully set to %s", use)
+			slog.Info(fmt.Sprintf("successfully set to %s", use))
 			return nil
 		},
 	}
@@ -134,9 +148,9 @@ func NewSetControlMagSafeLEDCommand() *cobra.Command {
 				return fmt.Errorf("failed to set to %s: %v", use, err)
 			}
 			if ret != "" {
-				logrus.Infof("daemon responded: %s", ret)
+				slog.Info(fmt.Sprintf("daemon responded: %s", ret))
 			}
-			logrus.Infof("successfully set to %s", use)
+			slog.Info(fmt.Sprintf("successfully set to %s", use))
 			return nil
 		},
 	}

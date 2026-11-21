@@ -2,13 +2,14 @@ package daemon
 
 import (
 	"encoding/json"
-	"github.com/charlie0129/batt/pkg/config"
+	"errors"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/charlie0129/batt/pkg/config"
 )
 
 type blockingSaveConfig struct {
@@ -23,27 +24,22 @@ func (c *blockingSaveConfig) Save() error {
 }
 
 func TestRangeRollbackSerializesLegacyWriterAndSnapshot(t *testing.T) {
-	useFirmwareLoopState(t, useMockSMC(t), &mockConf{upper: 80, lower: 78})
-	file, path := useTempConfig(t)
-	blocked := &blockingSaveConfig{Config: file, entered: make(chan struct{}), release: make(chan struct{})}
-	conf = blocked
-	router := setupRoutes()
+	f := newFixture(t, firmwareManaged, withFileConfig())
+	f.file.SetChargeRange(80, 78)
+	f.smc.fail("EnsureFirmwareChargeLimit", errors.New("cannot apply range"))
+	blocked := &blockingSaveConfig{Config: f.file, entered: make(chan struct{}), release: make(chan struct{})}
+	f.d.conf = blocked
 	rangeDone := make(chan *httptest.ResponseRecorder, 1)
-	go func() { rangeDone <- requestChargeRange(`{"upper":70,"lower":60}`) }()
-	<-blocked.entered
+	go func() { rangeDone <- f.put("/charge-range", `{"upper":70,"lower":60}`) }()
+	select {
+	case <-blocked.entered:
+	case <-time.After(time.Second):
+		t.Fatal("range did not reach persistence")
+	}
 	lowerDone := make(chan *httptest.ResponseRecorder, 1)
-	go func() {
-		req := httptest.NewRequest(http.MethodPut, "/lower-limit-delta", strings.NewReader("5"))
-		res := httptest.NewRecorder()
-		router.ServeHTTP(res, req)
-		lowerDone <- res
-	}()
+	go func() { lowerDone <- f.put("/lower-limit-delta", "5") }()
 	configDone := make(chan *httptest.ResponseRecorder, 1)
-	go func() {
-		res := httptest.NewRecorder()
-		router.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/config", nil))
-		configDone <- res
-	}()
+	go func() { configDone <- f.serve(http.MethodGet, "/config", "") }()
 	var earlyLower, earlyConfig *httptest.ResponseRecorder
 	select {
 	case earlyLower = <-lowerDone:
@@ -61,6 +57,9 @@ func TestRangeRollbackSerializesLegacyWriterAndSnapshot(t *testing.T) {
 		}
 	}
 	rangeResult := wait(rangeDone)
+	if earlyLower != nil || earlyConfig != nil {
+		t.Error("a competing request completed before the transaction finished")
+	}
 	if earlyLower == nil {
 		earlyLower = wait(lowerDone)
 	}
@@ -81,11 +80,11 @@ func TestRangeRollbackSerializesLegacyWriterAndSnapshot(t *testing.T) {
 	if raw.Limit == nil || *raw.Limit != 80 {
 		t.Fatalf("snapshot exposed provisional range: %s", res.Body)
 	}
-	stored, err := config.NewFile(path)
+	stored, err := config.NewFile(f.path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if stored.UpperLimit() != 80 || stored.LowerLimit() != 75 {
-		t.Fatalf("successful legacy update lost on rollback: %v", stored.LogrusFields())
+		t.Fatalf("successful legacy update lost on rollback: %v", stored.LogValue())
 	}
 }

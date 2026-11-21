@@ -5,13 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	pkgerrors "github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 
 	"github.com/charlie0129/batt/pkg/calibration"
 	"github.com/charlie0129/batt/pkg/compatibility"
@@ -92,6 +92,30 @@ func (c *Client) SetPreventSleepOnAdapterDisable(enabled bool) (string, error) {
 
 func (c *Client) SetAdapterMode(enabled bool) (string, error) {
 	return c.Put("/adapter-mode", strconv.FormatBool(enabled))
+}
+
+// NoDrainStatus describes the saved opt-in and whether its powerd policy is
+// active or waiting for other applications' sleep assertions to end.
+type NoDrainStatus struct {
+	Enabled bool   `json:"enabled"`
+	Phase   string `json:"phase"`
+	Message string `json:"message,omitempty"`
+}
+
+func (c *Client) SetNoDrain(enabled bool) (string, error) {
+	return c.Put("/no-drain", strconv.FormatBool(enabled))
+}
+
+func (c *Client) GetNoDrain() (*NoDrainStatus, error) {
+	ret, err := c.Get("/no-drain")
+	if err != nil {
+		return nil, err
+	}
+	var status NoDrainStatus
+	if err := json.Unmarshal([]byte(ret), &status); err != nil {
+		return nil, err
+	}
+	return &status, nil
 }
 
 func (c *Client) SetControlMagSafeLED(mode config.ControlMagSafeMode) (string, error) {
@@ -253,7 +277,7 @@ func (c *Client) SubscribeEvents(ctx context.Context) <-chan events.Event {
 
 			req, err := http.NewRequestWithContext(ctx, "GET", "http://unix/event", nil)
 			if err != nil {
-				logrus.WithError(err).Warn("SSE request build failed; retrying")
+				slog.Warn("SSE request build failed; retrying", "error", err)
 				select {
 				case <-time.After(retry):
 				case <-ctx.Done():
@@ -263,7 +287,7 @@ func (c *Client) SubscribeEvents(ctx context.Context) <-chan events.Event {
 			}
 			resp, err := c.httpClient.Do(req)
 			if err != nil {
-				logrus.WithError(err).Warn("SSE connect failed; retrying")
+				slog.Warn("SSE connect failed; retrying", "error", err)
 				select {
 				case <-time.After(retry):
 				case <-ctx.Done():
@@ -302,7 +326,7 @@ func (c *Client) SubscribeEvents(ctx context.Context) <-chan events.Event {
 					line, err := reader.ReadString('\n')
 					if err != nil {
 						_ = resp.Body.Close()
-						logrus.WithError(err).Debug("SSE stream ended")
+						slog.Debug("SSE stream ended", "error", err)
 						break loop
 					}
 					line = strings.TrimRight(line, "\r\n")

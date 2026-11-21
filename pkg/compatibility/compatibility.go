@@ -42,19 +42,17 @@ const (
 type Capabilities struct {
 	ChargingControl   bool              `json:"chargingControl"`
 	ChargeControlMode ChargeControlMode `json:"chargeControlMode"`
+	// NativeExactTargets means the native backend accepts exact percentage
+	// targets rather than only the values offered by the macOS slider.
+	NativeExactTargets bool `json:"nativeExactTargets,omitempty"`
 	// SupportedLimits lists the only upper limits the charge-control backend
 	// accepts, in ascending order. Empty means any limit from 10 to 100.
 	SupportedLimits []int `json:"supportedLimits,omitempty"`
+	ChargeRange     bool  `json:"chargeRange,omitempty"`
 	SleepHooks      bool  `json:"sleepHooks"`
 	MagSafeLED      bool  `json:"magSafeLED"`
-	// MagSafeLEDRetry advertises an explicit recovery operation on verified
-	// hardware; MagSafeLED itself stays false while the session has failed.
-	MagSafeLEDRetry     bool   `json:"magSafeLEDRetry,omitempty"`
-	MagSafeLEDInterface bool   `json:"magSafeLEDInterface,omitempty"`
-	MagSafeLEDReason    string `json:"magSafeLEDReason,omitempty"`
-	ChargeRange         bool   `json:"chargeRange,omitempty"`
-	AdapterControl      bool   `json:"adapterControl"`
-	Calibration         bool   `json:"calibration"`
+	AdapterControl  bool  `json:"adapterControl"`
+	Calibration     bool  `json:"calibration"`
 }
 
 // Permissive returns the fallback used by clients talking to an older or
@@ -77,14 +75,11 @@ func (c Capabilities) Supports(feature Feature) bool {
 	case FeatureChargingControl:
 		return c.ChargingControl
 	case FeatureLowerLimit:
-		// The native backend only takes an upper limit; Apple decides when
-		// charging resumes. Older daemons never report the native mode, so
-		// they keep the lower limit available.
 		return c.ChargingControl && c.ChargeControlMode != ChargeControlNative
 	case FeatureSleepHooks:
 		return c.SleepHooks
 	case FeatureMagSafeLED:
-		return c.MagSafeLED || c.MagSafeLEDRetry
+		return c.MagSafeLED
 	case FeatureAdapterControl:
 		return c.AdapterControl
 	case FeatureAdapterSleepPolicy:

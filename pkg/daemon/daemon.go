@@ -4,85 +4,180 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
-
-	"github.com/gin-gonic/gin"
-	"github.com/sirupsen/logrus"
 
 	"github.com/charlie0129/batt/pkg/calibration"
 	"github.com/charlie0129/batt/pkg/compatibility"
 	"github.com/charlie0129/batt/pkg/config"
 	"github.com/charlie0129/batt/pkg/events"
+	"github.com/charlie0129/batt/pkg/logging"
+	"github.com/charlie0129/batt/pkg/powerui"
 	"github.com/charlie0129/batt/pkg/smc"
 )
 
-var (
-	smcConn      *smc.AppleSMC
-	conf         config.Config
-	capabilities compatibility.Capabilities
+// Daemon is one running batt daemon: its configuration, the system interfaces
+// it drives, and all of its runtime state. New builds one, Run drives it.
+//
+// Nothing in this package is global, so tests build a Daemon per test against
+// a simulated Mac and run in parallel.
+type Daemon struct {
+	conf    config.Config
+	control controlStatus
 
-	sseHub    *events.EventHub // global hub instance initialized in Run()
+	smc        SMC
+	native     powerui.Controller
+	assertions SleepAssertions
+	notifier   SleepNotifier
+	battery    BatteryInfo
+
+	hub       *events.EventHub
 	scheduler *Scheduler
-)
 
-func setupRoutes() *gin.Engine {
-	gin.SetMode(gin.ReleaseMode)
+	// euid reports the effective user id. Native charge control needs root.
+	euid func() int
 
-	// TODO: unify these ugly handlers
+	// chargeControlMu guards capabilities and charger, which are set as a
+	// pair at startup and whenever adapter mode is toggled at runtime. It is a
+	// leaf lock.
+	chargeControlMu sync.RWMutex
+	capabilities    compatibility.Capabilities
+	charger         chargeSwitch
 
-	router := gin.New()
-	router.Use(gin.Recovery())
-	router.Use(ginLogger(logrus.StandardLogger()))
-	router.GET("/config", getConfig)
-	router.GET("/limit", getLimit)
-	router.PUT("/limit", setLimit)
-	router.PUT("/charge-range", setChargeRange)
-	router.PUT("/disable", setDisableFor)
-	router.POST("/charge-once/limit", postChargeOnceToLimit)
-	router.POST("/charge-once/full", postChargeOnceToFull)
-	router.POST("/charge-once/cancel", postCancelChargeOnce)
-	router.PUT("/lower-limit-delta", setLowerLimitDelta)
-	router.PUT("/prevent-idle-sleep", setPreventIdleSleep)
-	router.PUT("/disable-charging-pre-sleep", setDisableChargingPreSleep)
-	router.PUT("/prevent-system-sleep", setPreventSystemSleep)
-	router.PUT("/prevent-sleep-on-adapter-disable", setPreventSleepOnAdapterDisable)
-	router.PUT("/adapter", setAdapter)
-	router.PUT("/adapter/disable", setAdapterDisableFor)
-	router.GET("/adapter", getAdapter)
-	router.GET("/charging", getCharging)
-	router.GET("/battery-info", getBatteryInfo)
-	router.PUT("/magsafe-led", setControlMagSafeLED)
-	router.PUT("/adapter-mode", setAdapterMode)
-	router.GET("/current-charge", getCurrentCharge)
-	router.GET("/plugged-in", getPluggedIn)
-	router.GET("/charging-control-capable", getChargingControlCapable)
-	router.GET("/compatibility", getCompatibility)
-	router.GET("/version", getVersion)
+	// transitionMu serializes admission of calibration and temporary
+	// charge/adapter disable operations so concurrent requests cannot both
+	// pass their conflict checks before either operation persists its state.
+	transitionMu sync.Mutex
+
+	// loopMu serializes maintenance passes and guards the loop state below.
+	loopMu                       sync.Mutex
+	maintainedChargingInProgress bool
+	// chargeControlStopped is set once shutdown has released charging. A
+	// queued maintenance pass must not put the limit back before exit.
+	chargeControlStopped bool
+	// pendingNativeLimit is the native target macOS had accepted but not yet
+	// applied at the last maintenance pass, or zero. Handlers read it without
+	// waiting for a pass.
+	pendingNativeLimit atomic.Int32
+	// noDrainState describes whether the opt-in powerd policy is active,
+	// waiting for foreign sleep assertions, or fell back to native control.
+	noDrainState atomic.Pointer[noDrainStatus]
+	// noDrainReloadPending records a saved policy whose powerd reload has not
+	// completed. Saved policy absence alone must not mark a release complete.
+	noDrainReloadPending atomic.Bool
+
+	// loopDelay holds the maintain loop back around sleep and wake. See
+	// holdMaintainLoop.
+	loopDelay               sync.WaitGroup
+	loopInterval            time.Duration
+	loopRecorder            *TimeSeriesRecorder
+	continuousLoopThreshold time.Duration
+	// preSleepLoopDelay is how long the loop pauses after charging was
+	// disabled for sleep; postSleepLoopDelay how long after wake.
+	preSleepLoopDelay  time.Duration
+	postSleepLoopDelay time.Duration
+	lastWakeTime       time.Time
+	lastPrintTime      time.Time
+	lastStatus         loopStatus
+
+	calibrationMu         sync.Mutex
+	calibrationState      *calibration.State
+	calibrationStatePath  string
+	lastCalibrationStatus calibrationStatus
+
+	// adapterPolicyMu serializes adapter switches with the sleep policy that
+	// protects them.
+	adapterPolicyMu sync.Mutex
+	holds           *sleepHolds
+}
+
+// New wires a daemon to conf and sys. It does not touch the hardware; Run and
+// start do.
+func New(conf config.Config, sys System) *Daemon {
+	const loopInterval = 10 * time.Second
+	d := &Daemon{
+		conf:       conf,
+		smc:        sys.SMC,
+		native:     sys.NativeLimit,
+		assertions: sys.Assertions,
+		notifier:   sys.Notifier,
+		battery:    sys.Battery,
+		hub:        events.NewEventHub(),
+		euid:       os.Geteuid,
+
+		loopInterval:            loopInterval,
+		loopRecorder:            NewTimeSeriesRecorder(60, loopInterval),
+		continuousLoopThreshold: 1*time.Minute + 20*time.Second, // add 20s to be sure
+		preSleepLoopDelay:       60 * time.Second,
+		postSleepLoopDelay:      30 * time.Second,
+		lastWakeTime:            time.Now(),
+
+		calibrationState: &calibration.State{Phase: calibration.PhaseIdle},
+		holds:            newSleepHolds(sys.Sleep),
+	}
+	// Default to the legacy charge keys until capabilities are detected.
+	d.charger = chargeKeySwitch{d}
+	d.scheduler = NewScheduler(d.runScheduledCalibration, d.scheduledCalibrationPreCheck, d.notifyScheduleUpcoming, d.notifyScheduleError)
+	return d
+}
+
+// routes is the daemon's HTTP API.
+func (d *Daemon) routes() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /config", d.getConfig)
+	mux.HandleFunc("GET /limit", d.getLimit)
+	mux.HandleFunc("PUT /limit", d.setLimit)
+	mux.HandleFunc("PUT /charge-range", d.setChargeRange)
+	mux.HandleFunc("PUT /disable", d.setDisableFor)
+	mux.HandleFunc("POST /charge-once/limit", d.postChargeOnceToLimit)
+	mux.HandleFunc("POST /charge-once/full", d.postChargeOnceToFull)
+	mux.HandleFunc("POST /charge-once/cancel", d.postCancelChargeOnce)
+	mux.HandleFunc("PUT /lower-limit-delta", d.setLowerLimitDelta)
+	mux.HandleFunc("PUT /prevent-idle-sleep", d.setPreventIdleSleep)
+	mux.HandleFunc("PUT /disable-charging-pre-sleep", d.setDisableChargingPreSleep)
+	mux.HandleFunc("PUT /prevent-system-sleep", d.setPreventSystemSleep)
+	mux.HandleFunc("PUT /prevent-sleep-on-adapter-disable", d.setPreventSleepOnAdapterDisable)
+	mux.HandleFunc("PUT /adapter", d.setAdapter)
+	mux.HandleFunc("PUT /adapter/disable", d.setAdapterDisableFor)
+	mux.HandleFunc("GET /adapter", d.getAdapter)
+	mux.HandleFunc("GET /charging", d.getCharging)
+	mux.HandleFunc("GET /battery-info", d.getBatteryInfo)
+	mux.HandleFunc("PUT /magsafe-led", d.setControlMagSafeLED)
+	mux.HandleFunc("PUT /adapter-mode", d.setAdapterMode)
+	mux.HandleFunc("PUT /no-drain", d.setNoDrain)
+	mux.HandleFunc("GET /no-drain", d.getNoDrain)
+	mux.HandleFunc("GET /current-charge", d.getCurrentCharge)
+	mux.HandleFunc("GET /plugged-in", d.getPluggedIn)
+	mux.HandleFunc("GET /charging-control-capable", d.getChargingControlCapable)
+	mux.HandleFunc("GET /compatibility", d.getCompatibility)
+	mux.HandleFunc("GET /version", d.getVersion)
 	// Deprecated
-	router.GET("/power-telemetry", getPowerTelemetry)
-	router.GET("/telemetry", getUnifiedTelemetry)
-	router.GET("/event", getEventStream)
+	mux.HandleFunc("GET /power-telemetry", d.getPowerTelemetry)
+	mux.HandleFunc("GET /telemetry", d.getUnifiedTelemetry)
+	mux.HandleFunc("GET /event", d.getEventStream)
 
 	// Calibration endpoints (status folded into /telemetry)
-	router.POST("/calibration/start", postStartCalibration)
-	router.POST("/calibration/pause", postPauseCalibration)
-	router.POST("/calibration/resume", postResumeCalibration)
-	router.POST("/calibration/cancel", postCancelCalibration)
-	router.PUT("/schedule", setSchedule)
-	router.PUT("/schedule/postpone", postponeSchedule)
-	router.PUT("/schedule/skip", skipSchedule)
+	mux.HandleFunc("POST /calibration/start", d.postStartCalibration)
+	mux.HandleFunc("POST /calibration/pause", d.postPauseCalibration)
+	mux.HandleFunc("POST /calibration/resume", d.postResumeCalibration)
+	mux.HandleFunc("POST /calibration/cancel", d.postCancelCalibration)
+	mux.HandleFunc("PUT /schedule", d.setSchedule)
+	mux.HandleFunc("PUT /schedule/postpone", d.postponeSchedule)
+	mux.HandleFunc("PUT /schedule/skip", d.skipSchedule)
 
 	// Calibration settings endpoints
-	router.PUT("/calibration/discharge-threshold", setCalibrationDischargeThreshold)
-	router.PUT("/calibration/hold-duration", setCalibrationHoldDurationMinutes)
+	mux.HandleFunc("PUT /calibration/discharge-threshold", d.setCalibrationDischargeThreshold)
+	mux.HandleFunc("PUT /calibration/hold-duration", d.setCalibrationHoldDurationMinutes)
 
-	return router
+	return accessLog(recoverPanics(mux))
 }
 
 // removeStaleSocket removes a unix socket file left behind by a daemon that was
@@ -106,115 +201,98 @@ func removeStaleSocket(path string) error {
 	if err := os.Remove(path); err != nil {
 		return fmt.Errorf("remove stale socket %s: %w", path, err)
 	}
-	logrus.Infof("removed stale unix socket %s left by a previous daemon", path)
+	slog.Info(fmt.Sprintf("removed stale unix socket %s left by a previous daemon", path))
 	return nil
 }
 
-func Run(configPath string, unixSocketPath string, allowNonRoot bool) error {
-	var err error
-	conf, err = config.NewFile(configPath)
-	if err != nil {
-		logrus.Fatalf("failed to parse config during startup: %v", err)
+// stateDir is where the daemon keeps its runtime state files, next to the
+// config file.
+func stateDir(configPath string) string {
+	if configPath == "" {
+		return "/etc"
 	}
-	logrus.WithFields(conf.LogrusFields()).Infof("config loaded")
+	return filepath.Dir(configPath)
+}
+
+// Run loads the config, opens the Apple SMC and runs a daemon on the real
+// hardware until SIGINT or SIGTERM.
+func Run(configPath string, unixSocketPath string, allowNonRoot bool) error {
+	conf, err := config.NewFile(configPath)
+	if err != nil {
+		return fmt.Errorf("failed to parse config during startup: %w", err)
+	}
+	slog.Info("config loaded", "config", conf)
 
 	// Open Apple SMC and detect the charge-control mechanism from key
 	// presence before starting any loop, listener, scheduler, or API server.
-	smcConn = smc.New()
-	if err := smcConn.Open(); err != nil {
+	conn := smc.New()
+	if err := conn.Open(); err != nil {
 		return fmt.Errorf("open Apple SMC: %w", err)
 	}
-	if smcConn.ChargeControlMode() == compatibility.ChargeControlFirmware && smcConn.CheckMagSafeExistence() {
-		profile, profileErr := readFirmwareLEDProfile()
-		currentFirmwareLEDProfile = profile
-		if profileErr != nil {
-			logrus.WithError(profileErr).Warn("firmware LED profile unavailable; keeping LED control disabled")
-		}
+
+	d := New(conf, darwinSystem(conn))
+	return d.Run(stateDir(configPath), unixSocketPath, allowNonRoot)
+}
+
+// start detects the hardware, reconciles persisted state with it and restores
+// what a previous run left behind. It runs before any loop, listener or API
+// server, so a failure leaves the hardware untouched.
+func (d *Daemon) start(stateDir string) error {
+	caps := d.detectCapabilities()
+	if caps.NativeExactTargets && d.euid() != 0 {
+		return fmt.Errorf("native macOS 27 charge control requires the root batt daemon")
 	}
-	caps := detectCapabilities()
-	setChargeControl(caps)
-	logrus.WithFields(capabilityLogFields(caps)).Info("detected hardware capabilities")
-	disableUnsupportedConfiguredFeatures()
+	d.setChargeControl(caps)
+	slog.Info("detected hardware capabilities", capabilityLogAttrs(caps)...)
+	d.disableUnsupportedConfiguredFeatures()
 
-	initRuntimeStates(configPath)
-	disableUnsupportedCalibrationState()
-	restoreCalibrationSleepAssertion()
+	d.loadCalibrationState(filepath.Join(stateDir, "batt.state.json"))
+	if err := d.holds.init(filepath.Join(stateDir, "batt.sleep.json")); err != nil {
+		slog.Warn("failed to initialize sleep disabled state", "error", err)
+	}
+	d.disableUnsupportedCalibrationState()
+	d.restoreCalibrationSleepAssertion()
 
-	if err := ensureStartupSleepPolicy(); err != nil {
+	if err := d.ensureStartupSleepPolicy(); err != nil {
 		return err
 	}
 
-	router := setupRoutes()
-	sseHub = events.NewEventHub()
+	// Load persisted schedule from config
+	if cronExpr := d.conf.Cron(); d.getCapabilities().Calibration && cronExpr != "" {
+		if err := d.scheduler.Schedule(cronExpr); err != nil {
+			slog.Warn("failed to restore schedule from config", "error", err)
+		} else {
+			d.scheduler.Start()
+			slog.Info("restored schedule from config", "cron", cronExpr)
+		}
+	}
+	return nil
+}
+
+// Run starts the daemon and blocks until SIGINT or SIGTERM, then hands the
+// hardware back to macOS.
+func (d *Daemon) Run(stateDir string, unixSocketPath string, allowNonRoot bool) error {
+	if err := d.start(stateDir); err != nil {
+		_ = d.smc.Close()
+		return err
+	}
+	defer d.scheduler.Stop()
 
 	// Receive SIGHUP to reload config
 	go func() {
 		sigc := make(chan os.Signal, 1)
 		signal.Notify(sigc, syscall.SIGHUP)
 		for range sigc {
-			chargeControlTransitionMu.Lock()
-			err := conf.Load()
-			if err == nil {
-				invalidateControlStatus()
-				disableUnsupportedConfiguredFeatures()
-				err = reconcileReloadedSleepPolicy()
-			}
-			chargeControlTransitionMu.Unlock()
-			if err != nil {
-				logrus.WithError(err).Error("failed to reload config safely")
+			if err := d.reload(); err != nil {
+				slog.Error("failed to reload config safely", "error", err)
 				continue
 			}
-			logrus.Infof("config reloaded")
+			slog.Info("config reloaded")
 		}
 	}()
 
-	scheduler = NewScheduler(
-		func() error {
-			threshold := conf.CalibrationDischargeThreshold()
-			hold := conf.CalibrationHoldDurationMinutes()
-			return startCalibration(threshold, hold)
-		},
-		func() error {
-			status := getCalibrationStatus()
-			if status.Phase != calibration.PhaseIdle {
-				return ErrCalibrationInProgress
-			}
-			if !status.PluggedIn {
-				return errors.New("the Mac must be plugged in to start calibration")
-			}
-			return nil
-		},
-		func(data any) {
-			runAt := data.(time.Time)
-			sseHub.Publish(events.CalibrationAction, events.CalibrationActionEvent{
-				Action:  string(calibration.ActionScheduleUpComing),
-				Message: fmt.Sprintf("Calibration will start at %s", runAt.Format("Jan _2 15:04")),
-				Ts:      time.Now().Unix(),
-			})
-		},
-		func(data any) {
-			err := data.(error)
-			sseHub.Publish(events.CalibrationAction, events.CalibrationActionEvent{
-				Action:  string(calibration.ActionScheduleError),
-				Message: err.Error(),
-				Ts:      time.Now().Unix(),
-			})
-		},
-	)
-	defer scheduler.Stop()
-
-	// Load persisted schedule from config
-	if cronExpr := conf.Cron(); getCapabilities().Calibration && cronExpr != "" {
-		if err := scheduler.Schedule(cronExpr); err != nil {
-			logrus.WithError(err).Warn("failed to restore schedule from config")
-		} else {
-			scheduler.Start()
-			logrus.WithField("cron", cronExpr).Info("restored schedule from config")
-		}
-	}
-
 	srv := &http.Server{
-		Handler: router,
+		Handler: d.routes(),
 	}
 
 	// A daemon killed uncleanly (SIGKILL, panic, power loss) leaves its unix
@@ -224,46 +302,50 @@ func Run(configPath string, unixSocketPath string, allowNonRoot bool) error {
 	// adapter cut and the Mac on battery). launchd runs a single instance, so
 	// no live daemon owns the path here; remove a stale socket before binding.
 	if err := removeStaleSocket(unixSocketPath); err != nil {
-		logrus.Fatal(err)
+		_ = d.smc.Close()
+		return err
 	}
 
 	// Create the socket to listen on:
 	l, err := net.Listen("unix", unixSocketPath)
 	if err != nil {
-		logrus.Fatal(err)
+		_ = d.smc.Close()
+		return fmt.Errorf("listen on %s: %w", unixSocketPath, err)
 	}
 
-	if conf.AllowNonRootAccess() || allowNonRoot {
-		logrus.Infof("non-root access is allowed, chaning permissions of %s to 0777", unixSocketPath)
-		err = os.Chmod(unixSocketPath, 0777)
-		if err != nil {
-			logrus.Fatal(err)
+	if d.conf.AllowNonRootAccess() || allowNonRoot {
+		slog.Info(fmt.Sprintf("non-root access is allowed, chaning permissions of %s to 0777", unixSocketPath))
+		if err := os.Chmod(unixSocketPath, 0777); err != nil {
+			_ = l.Close()
+			_ = d.smc.Close()
+			return fmt.Errorf("chmod %s: %w", unixSocketPath, err)
 		}
 	}
 
 	// Serve HTTP on unix socket
 	go func() {
-		logrus.Infof("http server listening on %s", l.Addr().String())
+		slog.Info(fmt.Sprintf("http server listening on %s", l.Addr().String()))
 		if err := srv.Serve(l); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logrus.Fatal(err)
+			logging.Fatal("http server failed", "error", err)
 		}
 	}()
 
-	// Always listen: the callbacks no-op unless batt actively controls charging,
-	// and this lets a runtime adapter-mode toggle get working sleep hooks.
+	// Listen in every mode so telemetry observes a new power connection and a
+	// runtime adapter-mode toggle gets working sleep hooks.
+	notificationsDone := make(chan struct{})
 	go func() {
-		if err := listenNotifications(); err != nil {
-			logrus.Errorf("failed to listen to system sleep notifications: %v", err)
+		defer close(notificationsDone)
+		if err := d.notifier.Listen(daemonSleepHandler{d}); err != nil {
+			slog.Error("failed to listen to system sleep notifications", "error", err)
 			os.Exit(1)
 		}
 	}()
 
+	loopCtx, stopLoop := context.WithCancel(context.Background())
+	defer stopLoop()
 	go func() {
-		logrus.Debugln("main loop starts")
-
-		infiniteLoop()
-
-		logrus.Errorf("main loop exited unexpectedly")
+		slog.Debug("main loop starts")
+		d.runLoop(loopCtx)
 	}()
 
 	// Handle common process-killing signals, so we can gracefully shut down:
@@ -271,55 +353,72 @@ func Run(configPath string, unixSocketPath string, allowNonRoot bool) error {
 	signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM)
 	// Wait for a SIGINT or SIGTERM:
 	sig := <-sigc
-	logrus.Infof("caught signal \"%s\": shutting down.", sig)
+	slog.Info(fmt.Sprintf("caught signal \"%s\": shutting down.", sig))
 
-	logrus.Info("gracefully shutting down http server")
+	slog.Info("gracefully shutting down http server")
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	err = srv.Shutdown(ctx)
 	if err != nil {
-		logrus.Errorf("failed to gracefully shutdown http server, closing it immediately: %v", err)
+		slog.Error("failed to gracefully shutdown http server, closing it immediately", "error", err)
 		_ = srv.Close()
 	}
 	cancel()
 
-	logrus.Info("stopping listening notifications")
-	stopListeningNotifications()
+	slog.Info("stopping listening notifications")
+	d.notifier.Stop()
+	<-notificationsDone
+	stopLoop()
+	d.scheduler.Stop()
 
-	if err := AllowSleepOnAC(); err != nil {
-		logrus.Errorf("failed to remove PM assertion before exiting: %v", err)
-	}
-	if err := AllowCalibrationSleep(); err != nil {
-		logrus.Errorf("failed to remove calibration sleep assertion before exiting: %v", err)
-	}
+	nativeShutdown := d.getCapabilities().NativeExactTargets
+	cleanupErr := d.shutdown()
 
-	suspendControlStatus(true)
-	exitCaps := getCapabilities()
-	if exitCaps.ChargingControl {
-		if err := resetChargeControl(); err != nil {
-			logrus.Errorf("failed to reset charge control before exiting: %v", err)
-		}
+	slog.Info("exiting")
+	if nativeShutdown {
+		return cleanupErr
 	}
-
-	if err := shutdownAdapterAndSleep(); err != nil {
-		logrus.Errorf("failed to restore adapter/sleep state before exiting: %v", err)
-	}
-
-	logrus.Info("closing smc connection")
-	err = smcConn.Close()
-	if err != nil {
-		logrus.Errorf("failed to close smc connection: %v", err)
-	}
-
-	logrus.Info("exiting")
 	return nil
 }
 
-func reconcileReloadedSleepPolicy() error {
-	if !adapterSleepPolicyCapable() {
+// reload re-reads the config file, as on SIGHUP, and applies the parts of it
+// that take effect without a restart.
+func (d *Daemon) reload() error {
+	d.transitionMu.Lock()
+	defer d.transitionMu.Unlock()
+	if err := d.conf.Load(); err != nil {
+		return err
+	}
+	d.invalidateControlStatus()
+	d.disableUnsupportedConfiguredFeatures()
+	return d.reconcileReloadedSleepPolicy()
+}
+
+// shutdown hands charging, the adapter, sleep and the MagSafe LED back to
+// macOS and closes the SMC connection. It is the last thing Run does.
+func (d *Daemon) shutdown() error {
+	if err := d.assertions.AllowSleepOnAC(); err != nil {
+		slog.Error("failed to remove PM assertion before exiting", "error", err)
+	}
+	if err := d.assertions.AllowCalibrationSleep(); err != nil {
+		slog.Error("failed to remove calibration sleep assertion before exiting", "error", err)
+	}
+
+	cleanupErr := d.releaseHardwareOnExit()
+
+	slog.Info("closing smc connection")
+	if err := d.smc.Close(); err != nil {
+		slog.Error("failed to close smc connection", "error", err)
+		cleanupErr = errors.Join(cleanupErr, err)
+	}
+	return cleanupErr
+}
+
+func (d *Daemon) reconcileReloadedSleepPolicy() error {
+	if !d.adapterSleepPolicyCapable() {
 		return nil
 	}
-	if err := reconcileAdapterSleepPolicy(); err != nil {
-		return restoreAdapterAfterPolicyError(err)
+	if err := d.reconcileAdapterSleepPolicy(); err != nil {
+		return d.restoreAdapterAfterPolicyError(err)
 	}
 	return nil
 }
@@ -329,55 +428,60 @@ func reconcileReloadedSleepPolicy() error {
 // daemon: the charge limit does not depend on it. The file stays in place, no
 // hold can be taken while it exists, and wall power is already restored when
 // protection was missing. Every other failure stops the start.
-func ensureStartupSleepPolicy() error {
-	err := reconcileStartupSleepPolicy()
+func (d *Daemon) ensureStartupSleepPolicy() error {
+	err := d.reconcileStartupSleepPolicy()
 	var snapshotErr *sleepSnapshotError
 	if errors.As(err, &snapshotErr) {
-		logrus.WithError(err).Errorf("ignoring the unusable sleep snapshot %s; batt starts without it and cannot hold sleep until it is fixed or removed. If the Mac no longer sleeps, run `sudo pmset -a disablesleep 0`", snapshotErr.path)
+		slog.Error(fmt.Sprintf("ignoring the unusable sleep snapshot %s; batt starts without it and cannot hold sleep until it is fixed or removed. If the Mac no longer sleeps, run `sudo pmset -a disablesleep 0`", snapshotErr.path), "error", err)
 		return nil
 	}
 	return err
 }
 
-func reconcileStartupSleepPolicy() error {
-	if adapterSleepPolicyCapable() {
-		if err := reconcileAdapterSleepPolicy(); err != nil {
-			return fmt.Errorf("startup: %w", restoreAdapterAfterPolicyError(err))
+func (d *Daemon) reconcileStartupSleepPolicy() error {
+	if d.adapterSleepPolicyCapable() {
+		if err := d.reconcileAdapterSleepPolicy(); err != nil {
+			return fmt.Errorf("startup: %w", d.restoreAdapterAfterPolicyError(err))
 		}
 		return nil
 	}
-	if err := restorePendingSleepDisabled(); err != nil {
+	if err := d.holds.restorePending(); err != nil {
 		return fmt.Errorf("failed to restore pending sleep-disabled state during startup: %w", err)
 	}
 	return nil
 }
 
-func shutdownAdapterAndSleep() error {
-	if adapterSleepPolicyCapable() {
-		if err := smcEnableAdapter(); err != nil {
-			logrus.Errorf("failed to re-enable adapter before exiting: %v", err)
-			return err
-		}
-		if err := releaseAllSleepHolds(); err != nil {
-			logrus.Errorf("failed to restore SleepDisabled before exiting: %v", err)
-			return err
-		}
-	} else {
-		if err := releaseAllSleepHolds(); err != nil {
-			logrus.Errorf("failed to restore SleepDisabled before exiting: %v", err)
-			return err
-		}
+// releaseHardwareOnExit hands charging, the adapter, sleep and the MagSafe
+// LED back to macOS before the SMC connection is closed.
+func (d *Daemon) releaseHardwareOnExit() error {
+	var cleanupErr error
+	if err := d.releaseChargeControlOnExit(); err != nil {
+		slog.Error("failed to reset charge control before exiting", "error", err)
+		cleanupErr = errors.Join(cleanupErr, err)
 	}
-	return nil
+
+	if err := d.shutdownAdapterAndSleep(); err != nil {
+		slog.Error("failed to restore adapter/sleep state before exiting", "error", err)
+		cleanupErr = errors.Join(cleanupErr, err)
+	}
+
+	if err := d.releaseMagSafeLEDOnExit(); err != nil {
+		slog.Error("failed to return MagSafe LED control to the system before exiting", "error", err)
+		cleanupErr = errors.Join(cleanupErr, err)
+	}
+	return cleanupErr
 }
 
-func initRuntimeStates(configPath string) {
-	dir := "/etc"
-	if configPath != "" {
-		dir = filepath.Dir(configPath)
+func (d *Daemon) shutdownAdapterAndSleep() error {
+	if d.adapterSleepPolicyCapable() {
+		if err := d.enableAdapter(); err != nil {
+			slog.Error("failed to re-enable adapter before exiting", "error", err)
+			return err
+		}
 	}
-	initCalibrationState(filepath.Join(dir, "batt.state.json"))
-	if err := initSleepDisabledState(filepath.Join(dir, "batt.sleep.json")); err != nil {
-		logrus.WithError(err).Warn("failed to initialize sleep disabled state")
+	if err := d.holds.releaseAll(); err != nil {
+		slog.Error("failed to restore SleepDisabled before exiting", "error", err)
+		return err
 	}
+	return nil
 }

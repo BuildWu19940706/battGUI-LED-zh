@@ -1,85 +1,87 @@
 package daemon
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 
 	"github.com/charlie0129/batt/pkg/compatibility"
-	"github.com/gin-gonic/gin"
 )
 
-// setChargeRange commits a pair, rather than two independent client requests.
-// The transition lock also protects the timer and one-time-charge snapshot.
-func setChargeRange(c *gin.Context) {
-	if !requireCapability(c, compatibility.FeatureLowerLimit) {
+// setChargeRange commits both thresholds and supersedes any temporary limit
+// as one transition. A failed hardware write restores the previous workflow.
+func (d *Daemon) setChargeRange(w http.ResponseWriter, r *http.Request) {
+	if !d.requireCapability(w, compatibility.FeatureLowerLimit) {
 		return
 	}
 	var input struct {
 		Upper *int `json:"upper"`
 		Lower *int `json:"lower"`
 	}
-	if err := c.ShouldBindJSON(&input); err != nil || input.Upper == nil || input.Lower == nil {
-		c.IndentedJSON(http.StatusBadRequest, "upper and lower must be integer percentages")
+	if err := decodeJSON(r, &input); err != nil || input.Upper == nil || input.Lower == nil {
+		d.fail(w, http.StatusBadRequest, errors.New("upper and lower must be integer percentages"))
+		return
+	}
+
+	d.transitionMu.Lock()
+	defer d.transitionMu.Unlock()
+	if !d.requireCapability(w, compatibility.FeatureLowerLimit) {
 		return
 	}
 	upper, lower := *input.Upper, *input.Lower
-	if upper < 10 || upper > 100 || lower < 10 || lower >= upper {
-		c.IndentedJSON(http.StatusBadRequest, "range must satisfy 10 <= lower < upper <= 100")
+	if upper > 100 || lower < 10 || lower >= upper {
+		d.fail(w, http.StatusBadRequest, errors.New("range must satisfy 10 <= lower < upper <= 100"))
 		return
 	}
-	caps := getCapabilities()
+	caps := d.getCapabilities()
 	if !caps.SupportsLimit(upper) {
-		c.IndentedJSON(http.StatusBadRequest, fmt.Sprintf("this Mac only offers charge limits of %s", compatibility.FormatLimits(caps.SupportedLimits)))
+		d.fail(w, http.StatusBadRequest, fmt.Errorf("this Mac only offers charge limits of %s", compatibility.FormatLimits(caps.SupportedLimits)))
 		return
 	}
 	if caps.ChargeControlMode == compatibility.ChargeControlAdapter && upper < 100 && upper-lower < adapterMinBand {
-		c.IndentedJSON(http.StatusBadRequest, "adapter mode requires at least a 5% range")
+		d.fail(w, http.StatusBadRequest, fmt.Errorf("adapter mode requires at least a %d%% range", adapterMinBand))
 		return
 	}
 
-	chargeControlTransitionMu.Lock()
-	defer chargeControlTransitionMu.Unlock()
-	if calibrationOwnsChargeLimit() {
-		c.IndentedJSON(http.StatusBadRequest, ErrCalibrationControlsChargeLimit.Error())
+	d.loopMu.Lock()
+	defer d.loopMu.Unlock()
+	if d.calibrationOwnsChargeLimit() {
+		d.fail(w, http.StatusBadRequest, ErrCalibrationControlsChargeLimit)
 		return
 	}
-
-	maintainLoopInnerLock.Lock()
+	conf := d.conf
 	oldUpper, oldLower := conf.UpperLimit(), conf.LowerLimit()
 	oldUntil, oldPre := conf.DisableUntil(), conf.PreDisableLimit()
-	oldTarget := conf.ChargeOnceTarget()
+	oldTarget := d.supersedeChargeOnce()
+	conf.SetChargeRange(upper, lower)
+	conf.ClearDisableTimer()
 	restore := func() {
 		conf.SetChargeRange(oldUpper, oldLower)
-		conf.ClearDisableTimer()
 		if !oldUntil.IsZero() {
 			conf.SetDisableTimer(oldUntil, oldPre)
 		}
-		if oldTarget == 0 {
-			conf.ClearChargeOnceTarget()
-		} else {
+		if oldTarget > 0 {
 			conf.SetChargeOnceTarget(oldTarget)
 		}
 	}
-	conf.SetChargeRange(upper, lower)
-	conf.ClearDisableTimer()
-	conf.ClearChargeOnceTarget()
 	if err := conf.Save(); err != nil {
 		restore()
-		maintainLoopInnerLock.Unlock()
-		c.IndentedJSON(http.StatusInternalServerError, fmt.Sprintf("could not save charge range: %v", err))
+		d.fail(w, http.StatusInternalServerError, fmt.Errorf("could not save charge range: %w", err))
 		return
 	}
-	maintainLoopInnerLock.Unlock()
-	invalidateControlStatus()
-	if !maintainLoopForced() {
-		maintainLoopInnerLock.Lock()
+	d.invalidateControlStatus()
+	if !d.maintainLoopLocked(true) {
 		restore()
-		saveErr := conf.Save()
-		maintainLoopInnerLock.Unlock()
-		restored := maintainLoopForced()
-		c.IndentedJSON(http.StatusInternalServerError, fmt.Sprintf("could not apply charge range; previous settings restored (save error: %v, hardware restored: %t)", saveErr, restored))
+		err := errors.New("could not apply charge range")
+		if saveErr := conf.Save(); saveErr != nil {
+			err = errors.Join(err, fmt.Errorf("could not save previous settings: %w", saveErr))
+		}
+		if !d.maintainLoopLocked(true) {
+			err = errors.Join(err, errors.New("could not reapply previous hardware settings"))
+		}
+		d.fail(w, http.StatusInternalServerError, err)
 		return
 	}
-	reportSupersededChargeOnce(oldTarget, "charge range changed")
-	c.IndentedJSON(http.StatusCreated, fmt.Sprintf("charge range set to %d%%–%d%%", lower, upper))
+	d.reportSupersededChargeOnce(oldTarget, "charge range changed")
+	writeJSON(w, http.StatusCreated, fmt.Sprintf("charge range set to %d%%–%d%%", lower, upper))
 }

@@ -1,90 +1,97 @@
 package daemon
 
 import (
-	"github.com/charlie0129/batt/pkg/calibration"
-	"github.com/charlie0129/batt/pkg/config"
-	"github.com/charlie0129/batt/pkg/powerinfo"
-	"github.com/charlie0129/batt/pkg/smc"
+	"encoding/json"
+	"errors"
+	"net/http"
 	"testing"
 	"time"
+
+	"github.com/charlie0129/batt/pkg/powerinfo"
 )
 
-func seedReachedControl(t *testing.T) {
-	t.Helper()
-	controlState.Lock()
-	previousTracker, previousSnapshot, previousSuspended := controlState.tracker, controlState.snapshot, controlState.suspended
-	controlState.tracker.Reset()
-	controlState.suspended = false
-	controlState.snapshot = controlState.tracker.Update(powerinfo.ControlInput{Valid: true, PluggedIn: true, Target: 80, Lower: 78, Charge: 80, Now: time.Now()})
-	controlState.Unlock()
-	t.Cleanup(func() {
-		controlState.Lock()
-		controlState.tracker, controlState.snapshot, controlState.suspended = previousTracker, previousSnapshot, previousSuspended
-		controlState.Unlock()
-	})
-}
-
-func TestRangeEditInvalidatesReachedBeforeNextSample(t *testing.T) {
-	configured := &mockConf{upper: 80, lower: 78}
-	useFirmwareLoopState(t, firmwareChargeMock(t), configured)
-	seedReachedControl(t)
-	for _, body := range []string{`{"upper":90,"lower":85}`, `{"upper":80,"lower":78}`} {
-		if res := requestChargeRange(body); res.Code != 201 {
-			t.Fatalf("edit failed: %d %s", res.Code, res.Body)
+func TestControlTelemetryTracksAnUninterruptedChargeSession(t *testing.T) {
+	f := newFixture(t, firmwareManaged, withCharge(80), withCharging(false))
+	readState := func(want string) {
+		t.Helper()
+		f.d.loopOnce(time.Now())
+		response := f.mustServe(http.MethodGet, "/telemetry?power=0&calibration=0", "", http.StatusOK)
+		var telemetry struct {
+			Control *powerinfo.ControlStatus `json:"control"`
 		}
-		if got := getControlStatus(); got.State == "reached" || got.State == "holding" {
-			t.Fatalf("old green returned after target edit: %+v", got)
+		if err := json.Unmarshal(response.Body.Bytes(), &telemetry); err != nil {
+			t.Fatal(err)
+		}
+		if telemetry.Control == nil || telemetry.Control.State != want {
+			t.Fatalf("control = %+v, want %s", telemetry.Control, want)
 		}
 	}
+	readState("reached")
+	f.smc.setCharge(t, 79)
+	readState("holding")
+	daemonSleepHandler{f.d}.PowerConnectionChanged()
+	readState("paused")
+	f.smc.setCharge(t, 80)
+	readState("reached")
+	f.smc.setCharge(t, 79)
+	f.d.systemWillSleep()
+	readState("sleeping")
+	f.d.systemHasPoweredOn()
+	readState("paused")
+	f.battery.setErr(errors.New("no battery data"))
+	readState("unknown")
 }
 
-func TestOneTimeTargetInvalidatesReachedBeforeNextSample(t *testing.T) {
-	configured := &mockConf{upper: 80, lower: 78}
-	useChargeOnceDaemonState(t, configured, calibration.PhaseIdle)
-	seedReachedControl(t)
-	if err := startChargeOnce(100, 80); err != nil {
-		t.Fatal(err)
-	}
-	if got := getControlStatus(); got.State == "reached" {
-		t.Fatalf("one-time target reused old green: %+v", got)
-	}
-}
-
-func TestPowerConnectionEventInvalidatesBetweenSamples(t *testing.T) {
-	seedReachedControl(t)
-	observePowerConnection(true)
-	observePowerConnection(false)
-	observePowerConnection(true)
-	controlState.Lock()
-	got := controlState.tracker.Update(powerinfo.ControlInput{Valid: true, PluggedIn: true, Target: 80, Lower: 78, Charge: 79, Now: time.Now()})
-	controlState.Unlock()
-	if got.State != "paused" {
-		t.Fatalf("reconnect kept previous reached latch: %+v", got)
-	}
-}
-
-func TestMagSafeColorAcrossReconnectAndChargeLimit(t *testing.T) {
-	var tracker powerinfo.ControlTracker
-	for _, sample := range []struct {
-		name              string
-		charge, target    int
-		plugged, charging bool
-		want              smc.MagSafeLedState
-		label             string
-	}{
-		{"at limit", 80, 80, true, false, smc.LEDGreen, "green"},
-		{"unplugged", 79, 80, false, false, smc.LEDSystem, "system"},
-		{"reconnected without charging", 79, 80, true, false, smc.LEDGreen, "green"},
-		{"charging below limit", 79, 80, true, true, smc.LEDOrange, "orange"},
-		{"charging flag still set at limit", 80, 80, true, true, smc.LEDGreen, "green"},
-		{"charging flag still set above limit", 81, 80, true, true, smc.LEDGreen, "green"},
-		{"charging once toward full", 81, 100, true, true, smc.LEDOrange, "orange"},
+func TestControlTelemetryInvalidatesOnTargetChange(t *testing.T) {
+	for _, tc := range []struct{ name, method, path, body string }{
+		{"range", http.MethodPut, "/charge-range", `{"upper":90,"lower":85}`},
+		{"upper", http.MethodPut, "/limit", "90"},
+		{"lower", http.MethodPut, "/lower-limit-delta", "5"},
+		{"charge once", http.MethodPost, "/charge-once/full", ""},
 	} {
-		in := powerinfo.ControlInput{Valid: true, Now: time.Now(), Charge: sample.charge, Target: sample.target, ConfiguredUpper: 80, Lower: 75, PluggedIn: sample.plugged, Charging: sample.charging}
-		state := tracker.Update(in)
-		got, label := desiredMagSafeLED(in, state.State, config.ControlMagSafeModeEnabled, true)
-		if got != sample.want || label != sample.label {
-			t.Errorf("%s: got %v (%s), want %v (%s)", sample.name, got, label, sample.want, sample.label)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t, firmwareManaged, withCharge(80), withCharging(false))
+			f.d.loopOnce(time.Now())
+			if got := f.d.getControlStatus(); got.State != "reached" {
+				t.Fatalf("initial state = %+v", got)
+			}
+			f.mustServe(tc.method, tc.path, tc.body, http.StatusCreated)
+			if got := f.d.getControlStatus(); got.State != "unknown" {
+				t.Fatalf("old control snapshot after mutation: %+v", got)
+			}
+		})
+	}
+}
+
+func TestNativeControlTelemetryReportsOnlyConfirmedTargets(t *testing.T) {
+	f := newExactNativeFixture(t, withCharge(80), withCharging(false))
+	f.d.loopOnce(time.Now())
+	if got := f.d.getControlStatus(); got.State != "reached" || got.LowerPercent != 80 {
+		t.Fatalf("native macOS reported a lower threshold: %+v", got)
+	}
+	f.smc.setCharge(t, 79)
+	f.d.loopOnce(time.Now())
+	if got := f.d.getControlStatus(); got.State != "paused" {
+		t.Fatalf("native macOS reported a user-defined holding range: %+v", got)
+	}
+	f.smc.setCharge(t, 83)
+	f.battery.snapshot.Voltage, f.battery.snapshot.Amperage = 12, -1
+	f.d.loopOnce(time.Now())
+	if got := f.d.getControlStatus(); got.State != "discharging" {
+		t.Fatalf("native discharge toward a lower target reported %+v", got)
+	}
+	f.battery.snapshot.Amperage = 0
+	f.mustServe(http.MethodPut, "/no-drain", "true", http.StatusCreated)
+	f.asserts.foreign = noDrainCaffeinate()
+	f.mustServe(http.MethodPut, "/limit", "70", http.StatusCreated)
+	f.d.loopOnce(time.Now())
+	if got := f.d.getControlStatus(); got.State != "unknown" || f.native.noDrainLimit != 80 {
+		t.Fatalf("deferred target reported %+v while the Mac enforces %d", got, f.native.noDrainLimit)
+	}
+	f.asserts.foreign = nil
+	f.smc.setCharge(t, 70)
+	f.d.loopOnce(time.Now())
+	if got := f.d.getControlStatus(); got.State != "reached" || got.TargetPercent != 70 || f.native.noDrainLimit != 70 {
+		t.Fatalf("applied target reported %+v while the Mac enforces %d", got, f.native.noDrainLimit)
 	}
 }

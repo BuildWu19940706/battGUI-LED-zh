@@ -2,159 +2,142 @@ package daemon
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"os"
-	"sync"
 	"time"
 
 	"github.com/robfig/cron/v3"
-	"github.com/sirupsen/logrus"
 
 	"github.com/charlie0129/batt/pkg/calibration"
 	"github.com/charlie0129/batt/pkg/events"
+	"github.com/charlie0129/batt/pkg/powerui"
 )
 
-// smc accessors (function vars) for test seam; default to smcConn methods.
-var (
-	smcGetBatteryCharge     = func() (int, error) { return smcConn.GetBatteryCharge() }
-	smcIsChargingEnabled    = func() (bool, error) { return smcConn.IsChargingEnabled() }
-	smcEnableCharging       = func() error { return smcConn.EnableCharging() }
-	smcDisableCharging      = func() error { return smcConn.DisableCharging() }
-	smcIsAdapterEnabled     = func() (bool, error) { return smcConn.IsAdapterEnabled() }
-	smcEnableAdapter        = enableAdapterWithSleepPolicy
-	smcDisableAdapter       = disableAdapterWithSleepPolicy
-	smcIsPluggedIn          = func() (bool, error) { return smcConn.IsPluggedIn() }
-	preventCalibrationSleep = PreventCalibrationSleep
-	allowCalibrationSleep   = AllowCalibrationSleep
-)
-
-func calibrationSessionActive() bool {
-	return calibrationState.Phase != calibration.PhaseIdle && calibrationState.Phase != calibration.PhaseError
+func (d *Daemon) calibrationSessionActive() bool {
+	return d.calibrationState.Phase != calibration.PhaseIdle && d.calibrationState.Phase != calibration.PhaseError
 }
 
 // calibrationOwnsChargeLimit reports whether a calibration still has to write
 // back the charge limit it snapshotted. It is broader than
 // calibrationSessionActive: a failed calibration keeps its snapshot until it is
 // cancelled, and cancelling restores it.
-func calibrationOwnsChargeLimit() bool {
-	calibrationMu.Lock()
-	defer calibrationMu.Unlock()
+func (d *Daemon) calibrationOwnsChargeLimit() bool {
+	d.calibrationMu.Lock()
+	defer d.calibrationMu.Unlock()
 
-	return calibrationState.Phase != calibration.PhaseIdle
+	return d.calibrationState.Phase != calibration.PhaseIdle
 }
 
-func releaseCalibrationSleepAssertion() {
-	if err := allowCalibrationSleep(); err != nil {
-		logrus.WithError(err).Error("failed to release calibration sleep assertion")
+func (d *Daemon) releaseCalibrationSleepAssertion() {
+	if err := d.assertions.AllowCalibrationSleep(); err != nil {
+		slog.Error("failed to release calibration sleep assertion", "error", err)
 	}
 }
 
-func restoreCalibrationSleepAssertion() {
-	calibrationMu.Lock()
-	defer calibrationMu.Unlock()
-	if !calibrationSessionActive() {
+func (d *Daemon) restoreCalibrationSleepAssertion() {
+	d.calibrationMu.Lock()
+	defer d.calibrationMu.Unlock()
+	if !d.calibrationSessionActive() {
 		return
 	}
-	if err := preventCalibrationSleep(); err != nil {
-		logrus.WithError(err).Error("failed to restore calibration sleep assertion")
+	if err := d.assertions.PreventCalibrationSleep(); err != nil {
+		slog.Error("failed to restore calibration sleep assertion", "error", err)
 	}
 }
 
-func calibrationNeedsMaintainLoop() bool {
-	calibrationMu.Lock()
-	defer calibrationMu.Unlock()
-	return calibrationSessionActive() && !calibrationState.Paused
+func (d *Daemon) calibrationNeedsMaintainLoop() bool {
+	d.calibrationMu.Lock()
+	defer d.calibrationMu.Unlock()
+	return d.calibrationSessionActive() && !d.calibrationState.Paused
 }
 
-func enableChargingForCalibration() error {
-	if isManagedChargeControl() {
-		_, err := ensureManagedChargeLimitDisabled()
+func (d *Daemon) enableChargingForCalibration() error {
+	if d.isManagedChargeControl() {
+		_, err := d.ensureManagedChargeLimitDisabled()
 		return err
 	}
-	return smcEnableCharging()
+	return d.smc.EnableCharging()
 }
 
-func restoreChargeControlAfterCalibration(st *calibration.State) {
-	if isManagedChargeControl() {
+func (d *Daemon) restoreChargeControlAfterCalibration(st *calibration.State) {
+	if d.isManagedChargeControl() {
 		var err error
 		if st.SnapshotMaintain {
-			_, err = ensureManagedChargeLimit(st.SnapshotLowerLimit, st.SnapshotUpperLimit)
+			_, err = d.ensureManagedChargeLimit(st.SnapshotLowerLimit, st.SnapshotUpperLimit)
 		} else {
-			_, err = ensureManagedChargeLimitDisabled()
+			_, err = d.ensureManagedChargeLimitDisabled()
 		}
-		if err != nil {
-			logrus.WithError(err).Errorf("failed to restore %s charge limit after calibration", getCapabilities().ChargeControlMode)
+		// A restored native target that macOS applies later is not a failure;
+		// the next maintenance pass reports it.
+		if err != nil && !errors.Is(err, powerui.ErrRegistrationPending) {
+			slog.Error(fmt.Sprintf("failed to restore %s charge limit after calibration", d.getCapabilities().ChargeControlMode), "error", err)
 		}
 		return
 	}
 
 	if st.SnapshotChargingOn {
-		_ = smcEnableCharging()
+		_ = d.smc.EnableCharging()
 	} else {
-		_ = smcDisableCharging()
+		_ = d.smc.DisableCharging()
 	}
 }
 
-var (
-	// chargeControlTransitionMu serializes admission of calibration and temporary
-	// charge/adapter disable operations so concurrent requests cannot both pass
-	// their conflict checks before either operation persists its state.
-	chargeControlTransitionMu = &sync.Mutex{}
-	calibrationMu             = &sync.Mutex{}
-	calibrationState          = &calibration.State{Phase: calibration.PhaseIdle}
-	calibrationStatePath      = "" // set during daemon Run? Could derive from config path + suffix.
-)
-
-func initCalibrationState(path string) {
-	calibrationStatePath = path
+// loadCalibrationState reads the persisted calibration state from path and
+// keeps persisting it there. A calibration that was mid-flow is restored
+// paused, for safety.
+func (d *Daemon) loadCalibrationState(path string) {
+	d.calibrationStatePath = path
 	// Try load existing state
 	b, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return
 		}
-		logrus.WithError(err).Warn("failed to read calibration state")
+		slog.Warn("failed to read calibration state", "error", err)
 		return
 	}
 	var st calibration.State
 	if err := json.Unmarshal(b, &st); err != nil {
-		logrus.WithError(err).Warn("failed to unmarshal calibration state")
+		slog.Warn("failed to unmarshal calibration state", "error", err)
 		return
 	}
 	// On restart, mark paused (safety) if mid-flow
 	if st.Phase != calibration.PhaseIdle && st.Phase != calibration.PhaseRestore && st.Phase != calibration.PhaseError {
 		st.Paused = true
 	}
-	calibrationState = &st
+	d.calibrationState = &st
 }
 
-func persistCalibrationState() {
-	if calibrationStatePath == "" {
+func (d *Daemon) persistCalibrationState() {
+	if d.calibrationStatePath == "" {
 		return
 	}
-	b, err := json.MarshalIndent(calibrationState, "", "  ")
+	b, err := json.MarshalIndent(d.calibrationState, "", "  ")
 	if err != nil {
-		logrus.WithError(err).Error("marshal calibration state")
+		slog.Error("marshal calibration state", "error", err)
 		return
 	}
-	if err := os.WriteFile(calibrationStatePath, b, 0644); err != nil {
-		logrus.WithError(err).Error("write calibration state")
+	if err := os.WriteFile(d.calibrationStatePath, b, 0644); err != nil {
+		slog.Error("write calibration state", "error", err)
 	}
 }
 
-func startCalibration(threshold, holdMinutes int) error {
-	chargeControlTransitionMu.Lock()
-	defer chargeControlTransitionMu.Unlock()
+func (d *Daemon) startCalibration(threshold, holdMinutes int) error {
+	d.transitionMu.Lock()
+	defer d.transitionMu.Unlock()
 
-	calibrationMu.Lock()
-	defer calibrationMu.Unlock()
+	d.calibrationMu.Lock()
+	defer d.calibrationMu.Unlock()
 
-	if calibrationState.Phase == calibration.PhaseError {
+	conf := d.conf
+	if d.calibrationState.Phase == calibration.PhaseError {
 		// A failed calibration may have left the charge limit at 100. Its snapshot
 		// is the only record of the original limit, and Cancel restores it.
 		return ErrCalibrationControlsChargeLimit
 	}
-	if calibrationState.Phase != calibration.PhaseIdle {
+	if d.calibrationState.Phase != calibration.PhaseIdle {
 		return ErrCalibrationInProgress
 	}
 	if !conf.DisableUntil().IsZero() {
@@ -182,36 +165,35 @@ func startCalibration(threshold, holdMinutes int) error {
 	upper := conf.UpperLimit()
 	lower := conf.LowerLimit()
 	chargingEnabled := true
-	if !isManagedChargeControl() {
+	if !d.isManagedChargeControl() {
 		var err error
-		chargingEnabled, err = smcIsChargingEnabled()
+		chargingEnabled, err = d.smc.IsChargingEnabled()
 		if err != nil {
 			return fmt.Errorf("failed to check charging state before starting calibration: %w", err)
 		}
 	}
-	adapterEnabled, err := smcIsAdapterEnabled()
+	adapterEnabled, err := d.smc.IsAdapterEnabled()
 	if err != nil {
 		return fmt.Errorf("failed to check adapter state before starting calibration: %w", err)
 	}
 
-	if getCapabilities().AdapterControl {
-		if err := reconcileAdapterSleepPolicy(); err != nil {
+	if d.getCapabilities().AdapterControl {
+		if err := d.reconcileAdapterSleepPolicy(); err != nil {
 			return fmt.Errorf("failed to reconcile adapter sleep policy before starting calibration: %w", err)
 		}
 	}
-	if err := preventCalibrationSleep(); err != nil {
+	if err := d.assertions.PreventCalibrationSleep(); err != nil {
 		return fmt.Errorf("prevent sleep during calibration: %w", err)
 	}
 
-	if sseHub != nil {
-		sseHub.Publish(events.CalibrationAction, events.CalibrationActionEvent{
-			Action:  string(calibration.ActionStart),
-			Message: fmt.Sprintf("Start calibration: discharging to %d%%", threshold),
-			Ts:      time.Now().Unix(),
-		})
-	}
+	d.hub.Publish(events.CalibrationAction, events.CalibrationActionEvent{
+		Action:  string(calibration.ActionStart),
+		Message: fmt.Sprintf("Start calibration: discharging to %d%%", threshold),
+		Ts:      time.Now().Unix(),
+	})
 
-	calibrationState = &calibration.State{
+	d.invalidateControlStatus()
+	d.calibrationState = &calibration.State{
 		Phase:              calibration.PhaseDischarge,
 		StartedAt:          time.Now(),
 		Paused:             false,
@@ -224,7 +206,7 @@ func startCalibration(threshold, holdMinutes int) error {
 		HoldMinutes:        holdMinutes,
 	}
 
-	persistCalibrationState()
+	d.persistCalibrationState()
 
 	return nil
 }
@@ -246,30 +228,28 @@ type calibrationStatus struct {
 	phase  calibration.Phase
 }
 
-var lastCalibrationStatus calibrationStatus
-
 // applyCalibrationWithinLoop advances calibration phases using a provided charge reading.
 // Returns true if calibration is active (non-idle & non-error & not paused).
 //
 //nolint:gocyclo
-func applyCalibrationWithinLoop(charge int) bool {
-	calibrationMu.Lock()
-	defer calibrationMu.Unlock()
-	st := calibrationState
+func (d *Daemon) applyCalibrationWithinLoop(charge int) bool {
+	d.calibrationMu.Lock()
+	defer d.calibrationMu.Unlock()
+	conf := d.conf
+	st := d.calibrationState
 	prevPhase := st.Phase
 	if st.Phase == calibration.PhaseIdle || st.Phase == calibration.PhaseError || st.Paused {
 		return false
 	}
 
-	log := logrus.WithFields(logrus.Fields{
-		"phase":     st.Phase,
-		"charge":    charge,
-		"operation": "calibration",
-	})
+	log := slog.With("phase", st.Phase,
+		"charge", charge,
+		"operation", "calibration",
+	)
 	// Throttle debug logs to changes only.
-	if lastCalibrationStatus.charge != charge || lastCalibrationStatus.phase != st.Phase {
-		lastCalibrationStatus.charge = charge
-		lastCalibrationStatus.phase = st.Phase
+	if d.lastCalibrationStatus.charge != charge || d.lastCalibrationStatus.phase != st.Phase {
+		d.lastCalibrationStatus.charge = charge
+		d.lastCalibrationStatus.phase = st.Phase
 		log.Debug("calibration loop")
 	}
 
@@ -278,15 +258,15 @@ func applyCalibrationWithinLoop(charge int) bool {
 		if charge < st.Threshold {
 			// Transition to charge phase.
 			st.Phase = calibration.PhaseCharge
-			logrus.Info("discharge phase complete. starting charge phase")
-			logrus.Info("enabling adapter")
-			if err := smcEnableAdapter(); err != nil {
+			slog.Info("discharge phase complete. starting charge phase")
+			slog.Info("enabling adapter")
+			if err := d.enableAdapter(); err != nil {
 				st.LastError = err.Error()
 				st.Phase = calibration.PhaseError
 				break
 			}
-			logrus.Info("enabling charging")
-			if err := enableChargingForCalibration(); err != nil {
+			slog.Info("enabling charging")
+			if err := d.enableChargingForCalibration(); err != nil {
 				st.LastError = err.Error()
 				st.Phase = calibration.PhaseError
 				break
@@ -298,26 +278,26 @@ func applyCalibrationWithinLoop(charge int) bool {
 			}
 		} else {
 			log.Info("disabling adapter to allow discharge")
-			if err := smcDisableAdapter(); err != nil {
-				logrus.WithError(err).Error("failed to disable adapter during discharge phase")
+			if err := d.disableAdapter(); err != nil {
+				slog.Error("failed to disable adapter during discharge phase", "error", err)
 				st.LastError = err.Error()
 				st.Phase = calibration.PhaseError
 			}
 		}
 	case calibration.PhaseCharge:
 		if charge >= 100 {
-			logrus.WithField("holdDuration", time.Duration(st.HoldMinutes)*time.Minute).Info("charge phase complete. starting hold phase")
+			slog.Info("charge phase complete. starting hold phase", "holdDuration", time.Duration(st.HoldMinutes)*time.Minute)
 			st.Phase = calibration.PhaseHold
 			st.HoldEndTime = time.Now().Add(time.Duration(st.HoldMinutes) * time.Minute)
 		}
 	case calibration.PhaseHold:
 		if time.Now().After(st.HoldEndTime) {
-			logrus.Info("hold phase complete. starting post-hold phase, draining to previous limits")
+			slog.Info("hold phase complete. starting post-hold phase, draining to previous limits")
 			// Begin post-hold discharge back to previous upper limit (if snapshot < 100) or current configured upper.
 			// Ensure charging disabled to allow discharge. The post-hold phase never cuts the adapter
 			// again, so a failure here must end the calibration instead of waiting at full charge.
-			if err := smcDisableAdapter(); err != nil {
-				logrus.WithError(err).Error("failed to disable adapter during hold phase")
+			if err := d.disableAdapter(); err != nil {
+				slog.Error("failed to disable adapter during hold phase", "error", err)
 				st.LastError = err.Error()
 				// The limit is still 100 here. Write the snapshot back, as Cancel does, so the
 				// failed run does not leave the battery without a limit while it waits for
@@ -326,9 +306,9 @@ func applyCalibrationWithinLoop(charge int) bool {
 				conf.SetUpperLimit(st.SnapshotUpperLimit)
 				conf.SetLowerLimit(st.SnapshotLowerLimit)
 				if saveErr := conf.Save(); saveErr != nil {
-					logrus.WithError(saveErr).Warn("failed to save config after the calibration failed")
+					slog.Warn("failed to save config after the calibration failed", "error", saveErr)
 				}
-				restoreChargeControlAfterCalibration(st)
+				d.restoreChargeControlAfterCalibration(st)
 				st.Phase = calibration.PhaseError
 				break
 			}
@@ -342,16 +322,16 @@ func applyCalibrationWithinLoop(charge int) bool {
 			target = conf.UpperLimit()
 		}
 		if charge <= target {
-			logrus.Info("post-hold phase complete. starting restore phase")
+			slog.Info("post-hold phase complete. starting restore phase")
 			st.Phase = calibration.PhaseRestore
 		}
 	case calibration.PhaseRestore:
-		logrus.WithFields(logrus.Fields{
-			"upperLimit":       st.SnapshotUpperLimit,
-			"lowerLimit":       st.SnapshotLowerLimit,
-			"isCharging":       st.SnapshotChargingOn,
-			"isAdapterEnabled": st.SnapshotAdapterOn,
-		}).Info("restoring previous battery config and finishing calibration")
+		slog.Info("restoring previous battery config and finishing calibration",
+			"upperLimit", st.SnapshotUpperLimit,
+			"lowerLimit", st.SnapshotLowerLimit,
+			"isCharging", st.SnapshotChargingOn,
+			"isAdapterEnabled", st.SnapshotAdapterOn,
+		)
 		conf.SetUpperLimit(st.SnapshotUpperLimit)
 		conf.SetLowerLimit(st.SnapshotLowerLimit)
 		if err := conf.Save(); err != nil {
@@ -359,29 +339,29 @@ func applyCalibrationWithinLoop(charge int) bool {
 			st.Phase = calibration.PhaseError
 			break
 		}
-		restoreChargeControlAfterCalibration(st)
+		d.restoreChargeControlAfterCalibration(st)
 		var adapterErr error
 		if st.SnapshotAdapterOn {
-			adapterErr = smcEnableAdapter()
+			adapterErr = d.enableAdapter()
 		} else {
-			adapterErr = smcDisableAdapter()
+			adapterErr = d.disableAdapter()
 		}
 		if adapterErr != nil {
-			logrus.WithError(adapterErr).Error("failed to restore adapter during calibration restore phase")
+			slog.Error("failed to restore adapter during calibration restore phase", "error", adapterErr)
 			st.LastError = adapterErr.Error()
 			st.Phase = calibration.PhaseError
 			break
 		}
 		st.Phase = calibration.PhaseIdle
 	}
-	persistCalibrationState()
+	d.persistCalibrationState()
 	if st.Phase == calibration.PhaseIdle || st.Phase == calibration.PhaseError {
-		releaseCalibrationSleepAssertion()
+		d.releaseCalibrationSleepAssertion()
 	}
 
 	// Broadcast phase change if any
-	if sseHub != nil && st.Phase != prevPhase {
-		sseHub.Publish(events.CalibrationPhase, events.CalibrationPhaseEvent{
+	if st.Phase != prevPhase {
+		d.hub.Publish(events.CalibrationPhase, events.CalibrationPhaseEvent{
 			From: string(prevPhase),
 			To:   string(st.Phase),
 			Message: func() string {
@@ -405,104 +385,104 @@ func applyCalibrationWithinLoop(charge int) bool {
 			Ts: time.Now().Unix(),
 		})
 
-		logrus.WithField("event", events.CalibrationPhase).Debug("new event")
+		slog.Debug("new event", "event", events.CalibrationPhase)
 	}
 	return true
 }
 
-func pauseCalibration() error {
-	calibrationMu.Lock()
-	defer calibrationMu.Unlock()
-	if calibrationState.Phase == calibration.PhaseIdle {
+func (d *Daemon) pauseCalibration() error {
+	d.calibrationMu.Lock()
+	defer d.calibrationMu.Unlock()
+	st := d.calibrationState
+	if st.Phase == calibration.PhaseIdle {
 		return ErrCalibrationNotRunning
 	}
-	if !calibrationState.Paused {
-		calibrationState.Paused = true
-		calibrationState.PauseStartedAt = time.Now()
+	if !st.Paused {
+		st.Paused = true
+		st.PauseStartedAt = time.Now()
 
-		if sseHub != nil {
-			sseHub.Publish(events.CalibrationAction, events.CalibrationActionEvent{
-				Action:  string(calibration.ActionPause),
-				Message: fmt.Sprintf("Calibration paused at phase %s", calibrationState.Phase),
-				Ts:      time.Now().Unix(),
-			})
-		}
-
-		persistCalibrationState()
-	}
-
-	return nil
-}
-
-func resumeCalibration() error {
-	calibrationMu.Lock()
-	defer calibrationMu.Unlock()
-	if calibrationState.Phase == calibration.PhaseIdle {
-		return ErrCalibrationNotRunning
-	}
-	if !calibrationState.Paused {
-		return nil
-	}
-	if calibrationState.Phase == calibration.PhaseHold && !calibrationState.PauseStartedAt.IsZero() {
-		pausedDur := time.Since(calibrationState.PauseStartedAt)
-		calibrationState.HoldEndTime = calibrationState.HoldEndTime.Add(pausedDur)
-	}
-
-	if sseHub != nil {
-		sseHub.Publish(events.CalibrationAction, events.CalibrationActionEvent{
-			Action:  string(calibration.ActionResume),
-			Message: fmt.Sprintf("Calibration resumed (paused at %s)", calibrationState.PauseStartedAt.Format("Jan _2 15:04")),
+		d.hub.Publish(events.CalibrationAction, events.CalibrationActionEvent{
+			Action:  string(calibration.ActionPause),
+			Message: fmt.Sprintf("Calibration paused at phase %s", st.Phase),
 			Ts:      time.Now().Unix(),
 		})
+
+		d.persistCalibrationState()
 	}
 
-	calibrationState.Paused = false
-	calibrationState.PauseStartedAt = time.Time{}
-
-	persistCalibrationState()
 	return nil
 }
 
-func cancelCalibration() error {
-	calibrationMu.Lock()
-	defer calibrationMu.Unlock()
-	if calibrationState.Phase == calibration.PhaseIdle {
+func (d *Daemon) resumeCalibration() error {
+	d.calibrationMu.Lock()
+	defer d.calibrationMu.Unlock()
+	st := d.calibrationState
+	if st.Phase == calibration.PhaseIdle {
+		return ErrCalibrationNotRunning
+	}
+	if !st.Paused {
+		return nil
+	}
+	if st.Phase == calibration.PhaseHold && !st.PauseStartedAt.IsZero() {
+		pausedDur := time.Since(st.PauseStartedAt)
+		st.HoldEndTime = st.HoldEndTime.Add(pausedDur)
+	}
+
+	d.hub.Publish(events.CalibrationAction, events.CalibrationActionEvent{
+		Action:  string(calibration.ActionResume),
+		Message: fmt.Sprintf("Calibration resumed (paused at %s)", st.PauseStartedAt.Format("Jan _2 15:04")),
+		Ts:      time.Now().Unix(),
+	})
+
+	st.Paused = false
+	st.PauseStartedAt = time.Time{}
+
+	d.persistCalibrationState()
+	return nil
+}
+
+func (d *Daemon) cancelCalibration() error {
+	d.transitionMu.Lock()
+	defer d.transitionMu.Unlock()
+	d.calibrationMu.Lock()
+	defer d.calibrationMu.Unlock()
+	if d.calibrationState.Phase == calibration.PhaseIdle {
 		return ErrCalibrationNotRunning
 	}
 
-	st := calibrationState
+	d.invalidateControlStatus()
+	conf := d.conf
+	st := d.calibrationState
 	conf.SetUpperLimit(st.SnapshotUpperLimit)
 	conf.SetLowerLimit(st.SnapshotLowerLimit)
 	if err := conf.Save(); err != nil {
-		logrus.WithError(err).Warn("failed to save config while canceling calibration")
+		slog.Warn("failed to save config while canceling calibration", "error", err)
 	}
 
-	restoreChargeControlAfterCalibration(st)
+	d.restoreChargeControlAfterCalibration(st)
 	var adapterErr error
 	if st.SnapshotAdapterOn {
-		adapterErr = smcEnableAdapter()
+		adapterErr = d.enableAdapter()
 	} else {
-		adapterErr = smcDisableAdapter()
+		adapterErr = d.disableAdapter()
 	}
 	if adapterErr != nil {
-		logrus.WithError(adapterErr).Error("failed to restore adapter while canceling calibration")
+		slog.Error("failed to restore adapter while canceling calibration", "error", adapterErr)
 		st.LastError = adapterErr.Error()
 		st.Phase = calibration.PhaseError
-		persistCalibrationState()
+		d.persistCalibrationState()
 		return fmt.Errorf("failed to restore adapter while canceling calibration: %w", adapterErr)
 	}
 
-	if sseHub != nil {
-		sseHub.Publish(events.CalibrationAction, events.CalibrationActionEvent{
-			Action:  string(calibration.ActionCancel),
-			Message: fmt.Sprintf("Calibration canceled at phase %s and restored to previous state", st.Phase),
-			Ts:      time.Now().Unix(),
-		})
-	}
+	d.hub.Publish(events.CalibrationAction, events.CalibrationActionEvent{
+		Action:  string(calibration.ActionCancel),
+		Message: fmt.Sprintf("Calibration canceled at phase %s and restored to previous state", st.Phase),
+		Ts:      time.Now().Unix(),
+	})
 
-	calibrationState = &calibration.State{Phase: calibration.PhaseIdle}
-	persistCalibrationState()
-	releaseCalibrationSleepAssertion()
+	d.calibrationState = &calibration.State{Phase: calibration.PhaseIdle}
+	d.persistCalibrationState()
+	d.releaseCalibrationSleepAssertion()
 	return nil
 }
 
@@ -513,52 +493,50 @@ func cancelCalibration() error {
 //
 // This is used when disabling batt (limit=100%) to ensure calibration is not left
 // in a non-idle state.
-func cancelCalibrationNoRestoreNoError() {
-	calibrationMu.Lock()
-	defer calibrationMu.Unlock()
-	if calibrationState.Phase == calibration.PhaseIdle {
+func (d *Daemon) cancelCalibrationNoRestoreNoError() {
+	d.calibrationMu.Lock()
+	defer d.calibrationMu.Unlock()
+	if d.calibrationState.Phase == calibration.PhaseIdle {
 		return
 	}
 
-	st := calibrationState
+	st := d.calibrationState
 	var adapterErr error
 	if st.SnapshotAdapterOn {
-		adapterErr = smcEnableAdapter()
+		adapterErr = d.enableAdapter()
 	} else {
-		adapterErr = smcDisableAdapter()
+		adapterErr = d.disableAdapter()
 	}
 	if adapterErr != nil {
-		logrus.WithError(adapterErr).Error("failed to restore adapter while canceling calibration")
+		slog.Error("failed to restore adapter while canceling calibration", "error", adapterErr)
 		st.LastError = adapterErr.Error()
 		st.Phase = calibration.PhaseError
-		persistCalibrationState()
+		d.persistCalibrationState()
 		return
 	}
 
-	if sseHub != nil {
-		sseHub.Publish(events.CalibrationAction, events.CalibrationActionEvent{
-			Action:  string(calibration.ActionCancel),
-			Message: fmt.Sprintf("Calibration cancelled because at phase %s", calibrationState.Phase),
-			Ts:      time.Now().Unix(),
-		})
-	}
+	d.hub.Publish(events.CalibrationAction, events.CalibrationActionEvent{
+		Action:  string(calibration.ActionCancel),
+		Message: fmt.Sprintf("Calibration cancelled because at phase %s", st.Phase),
+		Ts:      time.Now().Unix(),
+	})
 
-	calibrationState = &calibration.State{Phase: calibration.PhaseIdle}
-	persistCalibrationState()
-	releaseCalibrationSleepAssertion()
+	d.calibrationState = &calibration.State{Phase: calibration.PhaseIdle}
+	d.persistCalibrationState()
+	d.releaseCalibrationSleepAssertion()
 }
 
-func getCalibrationStatus() *calibration.Status {
-	calibrationMu.Lock()
-	defer calibrationMu.Unlock()
-	st := calibrationState
-	charge, _ := smcGetBatteryCharge()
+func (d *Daemon) getCalibrationStatus() *calibration.Status {
+	d.calibrationMu.Lock()
+	defer d.calibrationMu.Unlock()
+	st := d.calibrationState
+	charge, _ := d.smc.GetBatteryCharge()
 	if charge < 0 {
 		charge = 0
 	} else if charge > 100 {
 		charge = 100
 	}
-	plugged, _ := smcIsPluggedIn()
+	plugged, _ := d.smc.IsPluggedIn()
 	remain := 0
 	if st.Phase == calibration.PhaseHold && !st.HoldEndTime.IsZero() {
 		effectiveEnd := st.HoldEndTime
@@ -576,11 +554,11 @@ func getCalibrationStatus() *calibration.Status {
 		if st.SnapshotUpperLimit > 0 && st.SnapshotUpperLimit <= 100 {
 			target = st.SnapshotUpperLimit
 		} else {
-			target = conf.UpperLimit()
+			target = d.conf.UpperLimit()
 		}
 	}
 
-	next, running := scheduler.Status()
+	next, running := d.scheduler.Status()
 	if !running {
 		next = time.Time{}
 	}
@@ -596,8 +574,49 @@ func getCalibrationStatus() *calibration.Status {
 	}
 }
 
+// runScheduledCalibration is the scheduler's task.
+func (d *Daemon) runScheduledCalibration() error {
+	threshold := d.conf.CalibrationDischargeThreshold()
+	hold := d.conf.CalibrationHoldDurationMinutes()
+	return d.startCalibration(threshold, hold)
+}
+
+// scheduledCalibrationPreCheck is the scheduler's pre-check: it refuses to
+// start a calibration that would be rejected or could not make progress.
+func (d *Daemon) scheduledCalibrationPreCheck() error {
+	status := d.getCalibrationStatus()
+	if status.Phase != calibration.PhaseIdle {
+		return ErrCalibrationInProgress
+	}
+	if !status.PluggedIn {
+		return fmt.Errorf("the Mac must be plugged in to start calibration")
+	}
+	return nil
+}
+
+func (d *Daemon) notifyScheduleUpcoming(data any) {
+	runAt := data.(time.Time)
+	d.hub.Publish(events.CalibrationAction, events.CalibrationActionEvent{
+		Action:  string(calibration.ActionScheduleUpComing),
+		Message: fmt.Sprintf("Calibration will start at %s", runAt.Format("Jan _2 15:04")),
+		Ts:      time.Now().Unix(),
+	})
+}
+
+func (d *Daemon) notifyScheduleError(data any) {
+	err := data.(error)
+	d.hub.Publish(events.CalibrationAction, events.CalibrationActionEvent{
+		Action:  string(calibration.ActionScheduleError),
+		Message: err.Error(),
+		Ts:      time.Now().Unix(),
+	})
+}
+
 // schedule sets the cron expression for scheduled calibrations and returns the next run times.
-func schedule(cronExpr string) ([]time.Time, error) {
+func (d *Daemon) schedule(cronExpr string) ([]time.Time, error) {
+	d.transitionMu.Lock()
+	defer d.transitionMu.Unlock()
+	conf := d.conf
 	if cronExpr == "" {
 		prevCron := conf.Cron()
 		if prevCron == "" {
@@ -607,17 +626,15 @@ func schedule(cronExpr string) ([]time.Time, error) {
 
 		conf.SetCron("")
 		if err := conf.Save(); err != nil {
-			logrus.WithError(err).Error("failed to save config")
+			slog.Error("failed to save config", "error", err)
 			return nil, fmt.Errorf("failed to save config: %w", err)
 		}
-		scheduler.Stop()
-		if sseHub != nil {
-			sseHub.Publish(events.CalibrationAction, events.CalibrationActionEvent{
-				Action:  string(calibration.ActionScheduleDisable),
-				Message: "Calibration schedule disabled",
-				Ts:      time.Now().Unix(),
-			})
-		}
+		d.scheduler.Stop()
+		d.hub.Publish(events.CalibrationAction, events.CalibrationActionEvent{
+			Action:  string(calibration.ActionScheduleDisable),
+			Message: "Calibration schedule disabled",
+			Ts:      time.Now().Unix(),
+		})
 		return nil, nil
 	}
 
@@ -630,15 +647,15 @@ func schedule(cronExpr string) ([]time.Time, error) {
 
 	conf.SetCron(cronExpr)
 	if err := conf.Save(); err != nil {
-		logrus.WithError(err).Error("failed to save config")
+		slog.Error("failed to save config", "error", err)
 		return nil, fmt.Errorf("failed to save config: %w", err)
 	}
 
-	if err := scheduler.Schedule(cronExpr); err != nil {
-		logrus.WithError(err).Error("failed to schedule calibration")
+	if err := d.scheduler.Schedule(cronExpr); err != nil {
+		slog.Error("failed to schedule calibration", "error", err)
 		return nil, err
 	}
-	scheduler.Start()
+	d.scheduler.Start()
 
 	// generate three next run times for response
 	nextRuns := []time.Time{}
@@ -649,45 +666,39 @@ func schedule(cronExpr string) ([]time.Time, error) {
 		now = next
 	}
 
-	if sseHub != nil {
-		sseHub.Publish(events.CalibrationAction, events.CalibrationActionEvent{
-			Action:  string(calibration.ActionSchedule),
-			Message: fmt.Sprintf("Calibration scheduled at %s", nextRuns[0].Format("Jan _2 15:04")), // TODO: use cron descriptor
-			Ts:      time.Now().Unix(),
-		})
-	}
+	d.hub.Publish(events.CalibrationAction, events.CalibrationActionEvent{
+		Action:  string(calibration.ActionSchedule),
+		Message: fmt.Sprintf("Calibration scheduled at %s", nextRuns[0].Format("Jan _2 15:04")), // TODO: use cron descriptor
+		Ts:      time.Now().Unix(),
+	})
 
 	return nextRuns, nil
 }
 
-func postpone(duration time.Duration) error {
-	if err := scheduler.Postpone(duration); err != nil {
-		logrus.WithError(err).Error("failed to postpone calibration")
+func (d *Daemon) postpone(duration time.Duration) error {
+	if err := d.scheduler.Postpone(duration); err != nil {
+		slog.Error("failed to postpone calibration", "error", err)
 		return err
 	}
 
-	if sseHub != nil {
-		sseHub.Publish(events.CalibrationAction, events.CalibrationActionEvent{
-			Action:  string(calibration.ActionSchedulePostpone),
-			Message: fmt.Sprintf("Calibration postponed for %s", duration.String()),
-			Ts:      time.Now().Unix(),
-		})
-	}
+	d.hub.Publish(events.CalibrationAction, events.CalibrationActionEvent{
+		Action:  string(calibration.ActionSchedulePostpone),
+		Message: fmt.Sprintf("Calibration postponed for %s", duration.String()),
+		Ts:      time.Now().Unix(),
+	})
 	return nil
 }
 
-func skipNextSchedule() error {
-	if err := scheduler.Skip(); err != nil {
-		logrus.WithError(err).Error("failed to skip next scheduled calibration")
+func (d *Daemon) skipNextSchedule() error {
+	if err := d.scheduler.Skip(); err != nil {
+		slog.Error("failed to skip next scheduled calibration", "error", err)
 		return err
 	}
 
-	if sseHub != nil {
-		sseHub.Publish(events.CalibrationAction, events.CalibrationActionEvent{
-			Action:  string(calibration.ActionScheduleSkip),
-			Message: "Calibration skipped",
-			Ts:      time.Now().Unix(),
-		})
-	}
+	d.hub.Publish(events.CalibrationAction, events.CalibrationActionEvent{
+		Action:  string(calibration.ActionScheduleSkip),
+		Message: "Calibration skipped",
+		Ts:      time.Now().Unix(),
+	})
 	return nil
 }

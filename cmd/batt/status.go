@@ -8,6 +8,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/charlie0129/batt/pkg/calibration"
+	"github.com/charlie0129/batt/pkg/client"
 	"github.com/charlie0129/batt/pkg/compatibility"
 	"github.com/charlie0129/batt/pkg/config"
 	"github.com/charlie0129/batt/pkg/powerinfo"
@@ -21,6 +22,7 @@ type statusData struct {
 	batteryInfo   *powerinfo.Battery
 	config        *config.RawFileConfig
 	capabilities  compatibility.Capabilities
+	noDrain       *client.NoDrainStatus
 }
 
 // chargeTarget returns the percentage batt is charging the battery towards. A
@@ -39,6 +41,9 @@ func chargeTarget(cfg *config.File) (int, bool) {
 // is reached. Returns nil when not applicable (not charging, no target, charge
 // already at/above the target, or result is zero).
 func computeTimeToLimit(data *statusData, cfg *config.File) *int {
+	if data.batteryInfo.FullChargeOverrideActive() {
+		return nil
+	}
 	target, ok := chargeTarget(cfg)
 	if !ok || data.batteryInfo.State != powerinfo.Charging || data.currentCharge >= target {
 		return nil
@@ -132,6 +137,8 @@ func fetchStatusData() (*statusData, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to get config: %w", err)
 	}
+	// Older daemons do not have this endpoint. Their status remains usable.
+	noDrain, _ := apiClient.GetNoDrain()
 
 	charging := false
 	if capabilities.ChargeControlMode == compatibility.ChargeControlLegacy {
@@ -157,6 +164,7 @@ func fetchStatusData() (*statusData, error) {
 		batteryInfo:   bat,
 		config:        conf,
 		capabilities:  capabilities,
+		noDrain:       noDrain,
 	}, nil
 }
 
@@ -192,8 +200,23 @@ func NewStatusCommand() *cobra.Command {
 				cmd.Println("    The firmware decides when to charge and can continue enforcing the limit during sleep.")
 			case compatibility.ChargeControlNative:
 				cmd.Println("  Control mode: " + bold("native macOS charge limit"))
-				cmd.Println("  Charge limit active: " + bool2Text(cfg.UpperLimit() < 100))
-				cmd.Println("    batt sets the limit built into macOS (System Settings -> Battery -> Charge Limit). macOS decides when to charge and keeps enforcing the limit during sleep.")
+				if data.capabilities.NativeExactTargets {
+					cmd.Println("  Charge limit configured: " + bool2Text(cfg.UpperLimit() < 100))
+					cmd.Println("    The battery can take a minute or more to respond to a new target.")
+					cmd.Println("    macOS decides when to charge and retains the target during sleep.")
+				} else {
+					cmd.Println("  Charge limit active: " + bool2Text(cfg.UpperLimit() < 100 && !data.batteryInfo.FullChargeOverrideActive()))
+					cmd.Println("    batt sets the limit built into macOS (System Settings -> Battery -> Charge Limit). macOS decides when to charge and retains the limit during sleep.")
+				}
+				if cfg.UpperLimit() < 100 && data.batteryInfo.FullChargeOverrideActive() {
+					notice := powerinfo.FullChargeOverrideNotice
+					if data.batteryInfo.FullChargeOverrideAtFull(data.currentCharge) {
+						notice = powerinfo.FullChargeOverrideAtFullNotice
+					}
+					cmd.Println("  Notice: " + notice)
+				} else if cfg.UpperLimit() < 100 && data.batteryInfo.ChargeLimitPendingActive() {
+					cmd.Println("  Notice: " + powerinfo.ChargeLimitPendingNotice)
+				}
 			case compatibility.ChargeControlAdapter:
 				cmd.Println("  Control mode: " + bold("adapter (wall power)"))
 				cmd.Println("  Charge limit active: " + bool2Text(cfg.UpperLimit() < 100))
@@ -299,6 +322,25 @@ func NewStatusCommand() *cobra.Command {
 				cmd.Printf("  Prevent sleep while adapter is disabled: %s\n", bool2Text(cfg.PreventSleepOnAdapterDisable()))
 			}
 			cmd.Printf("  Allow non-root users to access the daemon: %s\n", bool2Text(cfg.AllowNonRootAccess()))
+			if data.noDrain != nil && data.capabilities.NativeExactTargets {
+				label := "disabled"
+				switch data.noDrain.Phase {
+				case "active":
+					label = "active (wall power above the limit)"
+				case "waiting":
+					label = "waiting for other apps' sleep prevention"
+				case "error":
+					label = "unavailable; regular native limit restored"
+				case "off":
+					if data.noDrain.Enabled {
+						label = "enabled"
+					}
+				}
+				cmd.Printf("  No-drain (powerd): %s\n", bold("%s", label))
+				if data.noDrain.Message != "" && data.noDrain.Phase != "active" {
+					cmd.Printf("    %s\n", data.noDrain.Message)
+				}
+			}
 
 			if data.capabilities.MagSafeLED {
 				mode := cfg.ControlMagSafeLED()
@@ -315,7 +357,7 @@ func NewStatusCommand() *cobra.Command {
 			cmd.Println()
 			cmd.Println(bold("Hardware compatibility:"))
 			cmd.Printf("  Charge control mode: %s\n", bold("%s", data.capabilities.ChargeControlMode))
-			if limits := data.capabilities.SupportedLimits; len(limits) > 0 {
+			if limits := data.capabilities.SupportedLimits; len(limits) > 0 && !data.capabilities.NativeExactTargets {
 				cmd.Printf("  Supported charge limits: %s\n", bold("%s", compatibility.FormatLimits(limits)))
 			}
 			cmd.Printf("  Sleep hooks: %s\n", bool2Text(data.capabilities.SleepHooks))

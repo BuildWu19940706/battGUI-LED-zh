@@ -1,6 +1,6 @@
 # batt 中文核心增强版
 
-此源码合并自 [上游 batt](https://github.com/charlie0129/batt/commit/cab16c7abd7dcd99dd558b7f609072256b7e377c)，沿用 GPL-2.0 许可证。
+中文版 `v0.10.0` 合并自 [上游 batt](https://github.com/charlie0129/batt/commit/cab16c7abd7dcd99dd558b7f609072256b7e377c)，沿用 GPL-2.0 许可证。
 
 ## 使用
 
@@ -31,7 +31,7 @@
 3. 打开应用，首次安装选择“安装后台服务…”，升级时选择“升级后台服务…”，在系统弹窗中输入管理员密码。新版 GUI 需要配套后台才能使用新增功能。
 4. 等待约 10 秒，核对显示的上下限与自己的设置一致，再按上述菜单路径启用灯控。
 
-交付包使用本地 ad-hoc 签名，未作 Apple Developer ID 公证。
+交付包由 GitHub Actions 构建，使用 ad-hoc 签名，未作 Apple Developer ID 公证。
 
 ## 回退原版
 
@@ -46,7 +46,7 @@ go mod download
 go test ./...
 go test -race ./pkg/daemon ./pkg/client ./pkg/config ./pkg/compatibility ./pkg/powerinfo
 go vet ./...
-make app VERSION=v0.10.0-zh.1-local
+make app VERSION=v0.10.0
 codesign --force --deep --sign - bin/batt.app
 ```
 

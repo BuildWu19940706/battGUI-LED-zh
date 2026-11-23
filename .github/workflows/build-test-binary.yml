@@ -1,4 +1,4 @@
-name: Build Test Binary
+name: Build batt
 
 on:
   push:
@@ -45,8 +45,49 @@ jobs:
         with:
           go-version: 1.24
 
-      - name: Build
+      - name: Build test binary
+        if: github.ref_type != 'tag'
         run: make
+
+      - name: Build and verify macOS release package
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][A-Za-z0-9.-]+)?$ ]]
+          make app VERSION="$tag" GOARCH=arm64
+          codesign --force --deep --sign - bin/batt.app
+
+          mkdir -p dist/release
+          app_zip="dist/release/batt-$tag-macos-arm64.zip"
+          ditto -c -k --keepParent --noextattr --norsrc bin/batt.app "$app_zip"
+          git archive --format=zip --prefix="batt-$tag/" --output="dist/release/batt-$tag-source.zip" HEAD
+
+          verify_dir=$(mktemp -d)
+          ditto -x -k "$app_zip" "$verify_dir"
+          app="$verify_dir/batt.app"
+          codesign --verify --deep --strict "$app"
+          exe="$app/Contents/MacOS/batt"
+          test "$(lipo -archs "$exe")" = arm64
+          bundle_version="${tag#v}"
+          test "$(plutil -extract CFBundleShortVersionString raw "$app/Contents/Info.plist")" = "${bundle_version%%[-+]*}"
+          "$exe" version 2>&1 | grep -Fx "Client: $tag"
+          go version -m "$exe" | grep -F "vcs.revision=$GITHUB_SHA"
+          cmp README.zh-CN.md "$app/Contents/Resources/README.zh-CN.md"
+          cmp pkg/gui/locales/zh-Hans.json "$app/Contents/Resources/zh-Hans.json"
+
+          cd dist/release
+          shasum -a 256 *.zip > SHA256SUMS.txt
+          shasum -a 256 -c SHA256SUMS.txt
+
+      - name: Upload release files
+        if: github.ref_type == 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ github.ref_name }}
+          path: dist/release/
+          if-no-files-found: error
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4

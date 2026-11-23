@@ -787,8 +787,13 @@ func (f *File) Save() error {
 	if err != nil {
 		return pkgerrors.Wrapf(err, "failed to open file %s", f.filepath)
 	}
-	defer os.Remove(fp.Name())
-	defer fp.Close()
+	// 提前返回时清理临时文件；正常保存时，下方会先检查 Close 的结果。
+	defer func() {
+		_ = fp.Close()
+		if err := os.Remove(fp.Name()); err != nil && !os.IsNotExist(err) {
+			slog.Warn("failed to remove temporary config file", "error", err)
+		}
+	}()
 	mode := os.FileMode(0644)
 	if info, err := os.Stat(target); err == nil {
 		mode = info.Mode().Perm()

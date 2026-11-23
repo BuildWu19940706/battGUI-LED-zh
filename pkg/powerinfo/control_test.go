@@ -5,10 +5,12 @@ import (
 	"time"
 )
 
+const wantPaused = "paused"
+
 func TestControlTargetAndHold(t *testing.T) {
 	tracker := ControlTracker{}
 	in := ControlInput{Valid: true, PluggedIn: true, Target: 80, Lower: 78, Charge: 79, Now: time.Unix(100, 0)}
-	if got := tracker.Update(in); got.State != "paused" {
+	if got := tracker.Update(in); got.State != wantPaused {
 		t.Fatalf("a paused 79%% battery with no history is not reached: %+v", got)
 	}
 	in.Charging = true
@@ -25,7 +27,7 @@ func TestControlTargetAndHold(t *testing.T) {
 		t.Fatal(got)
 	}
 	in.Charge = 77
-	if got := tracker.Update(in); got.State != "paused" {
+	if got := tracker.Update(in); got.State != wantPaused {
 		t.Fatal(got)
 	}
 }
@@ -51,7 +53,7 @@ func TestControlInvalidatesReachedHistory(t *testing.T) {
 			tc.change(&in)
 			tracker.Update(in)
 			in = ControlInput{Valid: true, PluggedIn: true, Target: 80, Lower: 78, Charge: 79, Now: in.Now.Add(time.Second)}
-			if got := tracker.Update(in); got.State != "paused" {
+			if got := tracker.Update(in); got.State != wantPaused {
 				t.Fatalf("stale green after %s: %+v", tc.name, got)
 			}
 		})
@@ -65,7 +67,7 @@ func TestControlSpecialModes(t *testing.T) {
 		want string
 	}{
 		{"one time full still charging", ControlInput{Target: 100, Charge: 80, Charging: true}, "charging"},
-		{"100 percent is not proof of full", ControlInput{Target: 100, Charge: 100}, "paused"},
+		{"100 percent is not proof of full", ControlInput{Target: 100, Charge: 100}, wantPaused},
 		{"confirmed full", ControlInput{Target: 100, Charge: 100, Full: true}, "reached"},
 		{"discharge above target", ControlInput{Target: 80, Charge: 90, ForcedDischarge: true}, "discharging"},
 		{"firmware above target with battery draw", ControlInput{Target: 80, Charge: 90, Discharging: true}, "reached"},
@@ -101,7 +103,7 @@ func TestControlNativeDischargeAboveTarget(t *testing.T) {
 	}
 	in.Charge = 79
 	in.Discharging = false
-	if got := tracker.Update(in); got.State != "paused" {
+	if got := tracker.Update(in); got.State != wantPaused {
 		t.Fatalf("drain should clear the previously reached target: %+v", got)
 	}
 }

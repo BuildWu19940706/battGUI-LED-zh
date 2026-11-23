@@ -6,6 +6,8 @@ import (
 	"strings"
 )
 
+const simplifiedChineseLocale = "zh-Hans"
+
 // English message templates are the stable keys shared with Objective-C.
 //
 //go:embed locales/zh-Hans.json
@@ -25,12 +27,12 @@ func selectLocale(language string) string {
 		return "en"
 	}
 	if language == "zh" || strings.HasPrefix(language, "zh-hans") || language == "zh-cn" || language == "zh-sg" {
-		return "zh-Hans"
+		return simplifiedChineseLocale
 	}
 	return "en"
 }
 func translate(locale, message string) string {
-	if locale == "zh-Hans" {
+	if locale == simplifiedChineseLocale {
 		if value, ok := chineseMessages[message]; ok {
 			return value
 		}
@@ -42,7 +44,7 @@ func tr(message string) string { return translate(activeLocale, message) }
 func configureLocalization(language string) {
 	activeLocale = selectLocale(language)
 	resource := []byte("{}")
-	if activeLocale == "zh-Hans" {
+	if activeLocale == simplifiedChineseLocale {
 		resource = chineseResource
 	}
 	configureNativeLocalization(string(resource))

@@ -24,7 +24,7 @@ func (c *menuController) subscribeEvents(ctx context.Context) {
 				continue
 			}
 			body := payload.Message
-			if activeLocale == "zh-Hans" {
+			if activeLocale == simplifiedChineseLocale {
 				body = fmt.Sprintf(tr("Calibration action: %s"), tr(payload.Action))
 				if payload.Action == "ScheduleError" {
 					body += "\n" + payload.Message
@@ -39,7 +39,7 @@ func (c *menuController) subscribeEvents(ctx context.Context) {
 			}
 			if calibrationPhaseNotifies(calibration.Phase(payload.To)) {
 				body := payload.Message
-				if activeLocale == "zh-Hans" {
+				if activeLocale == simplifiedChineseLocale {
 					body = fmt.Sprintf(tr("Calibration phase: %s"), tr(payload.To))
 					if payload.To == "Error" {
 						body += "\n" + payload.Message
@@ -54,7 +54,7 @@ func (c *menuController) subscribeEvents(ctx context.Context) {
 				continue
 			}
 			body := payload.Message
-			if activeLocale == "zh-Hans" {
+			if activeLocale == simplifiedChineseLocale {
 				switch payload.Action {
 				case "Start":
 					body = fmt.Sprintf(tr("One-time charge to %d%% started."), payload.Target)

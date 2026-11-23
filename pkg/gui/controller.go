@@ -179,41 +179,6 @@ func (c *menuController) refreshOnOpen() {
 	}
 }
 
-func (c *menuController) refreshDisableSchedules() {
-	rawConfig, err := c.api.GetConfig()
-	if err != nil {
-		slog.Debug("Failed to refresh temporary disable schedule", "error", err)
-		return
-	}
-	conf := config.NewFileFromConfig(rawConfig, "")
-	c.updateDisableSchedules(conf)
-	c.menu.setChecked(itemPreventSleepOnAdapterDisable, conf.PreventSleepOnAdapterDisable())
-	c.menu.setChecked(itemNoDrain, conf.NoDrain())
-
-	currentCharge, err := c.api.GetCurrentCharge()
-	if err != nil {
-		slog.Debug("Failed to refresh current charge", "error", err)
-		currentCharge = c.currentCharge
-	}
-	c.updateChargeOnce(conf, currentCharge)
-	if c.capabilities.ChargeControlMode == compatibility.ChargeControlNative {
-		if batteryInfo, err := c.api.GetBatteryInfo(); err == nil {
-			c.updateNativeLimitNotice(batteryInfo)
-		} else {
-			c.menu.setHidden(itemNativeLimitNotice, true)
-			slog.Debug("Failed to refresh native limit state", "error", err)
-		}
-	} else {
-		c.menu.setHidden(itemNativeLimitNotice, true)
-	}
-
-	if c.capabilities.AdapterControl {
-		if adapter, err := c.api.GetAdapter(); err == nil {
-			c.updateAdapterState(adapter)
-		}
-	}
-}
-
 func (c *menuController) updateDisableSchedules(conf config.Config) {
 	c.updateDisableSchedule(conf)
 	c.updateAdapterDisableSchedule(conf)
